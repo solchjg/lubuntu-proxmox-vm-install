@@ -75,6 +75,7 @@ MTU=""
 KEYBOARD=""
 VERBOSE="no"
 START_VM="yes"
+VM_CREATED="no"           # set once qm create succeeds; lets abort clean up
 
 # Post-install choices
 VM_PASSWORD=""
@@ -109,6 +110,7 @@ start_logging() {
 }
 trap cleanup EXIT
 trap 'msg_error "Failed at line $LINENO: $BASH_COMMAND"' ERR
+trap 'trap - INT; abort_install "Interrupted (Ctrl+C)."' INT
 
 exit_script() {
   clear
@@ -425,6 +427,7 @@ create_vm() {
   if [[ "$BIOS" == "ovmf" ]]; then
     qm set "$VMID" --efidisk0 "${STORAGE}:1,efitype=4m,pre-enrolled-keys=1" >/dev/null
   fi
+  VM_CREATED="yes"
   msg_ok "Created VM ${BL}${VMID}${CL} (${HN})"
 }
 
@@ -446,22 +449,89 @@ manual_install_handoff() {
    * Password:              the password you just entered in this script
    * Keyboard layout:       English (US)
    * When it says the installation is complete, ${BOLD}do NOT click Restart${CL}.
-     Come back here instead.
+     Come back here and press Enter.
+
+ A status line is printed every 30 seconds while you install.
+ Press Enter at any time to continue or to abort.
 
 EOF
-  # Don't take the user's word for it: an empty disk means the installer has
-  # not run (or not got far), and rebooting would land in the UEFI menu.
-  local rc
+  wait_for_install
+}
+
+# One status line: elapsed time, VM state, data written to the disk so far,
+# and whether the disk has partitions yet.
+install_status() {
+  local start="$1" elapsed json state written parts rc
+  elapsed=$(( $(date +%s) - start ))
+  json="$(pvesh get "/nodes/$(hostname)/qemu/${VMID}/status/current" --output-format json 2>/dev/null || echo '{}')"
+  state="$(perl -MJSON -0777 -ne 'my $j = decode_json($_); print $j->{status} // "unknown"' <<<"$json")"
+  written="$(perl -MJSON -0777 -ne 'my $j = decode_json($_); my $b = $j->{blockstat}{scsi0}{wr_bytes} // 0;
+    printf "%.1f GiB", $b / 1073741824' <<<"$json")"
+  rc=0; disk_has_os || rc=$?
+  case "$rc" in 0) parts="yes" ;; 1) parts="none yet" ;; *) parts="unknown" ;; esac
+  printf ' [%02d:%02d] VM %s | written to disk: %s | partitions: %s\n' \
+    $((elapsed / 60)) $((elapsed % 60)) "$state" "$written" "$parts"
+}
+
+# Wait for the manual install with a status line every 30 seconds. Enter
+# opens a plain prompt: continue, keep waiting, or abort and clean up.
+wait_for_install() {
+  local start ans rc
+  start=$(date +%s)
+  install_status "$start"
   while true; do
-    read -r -p " Press Enter once the installer reports it has finished... " _
-    rc=0; disk_has_os || rc=$?
-    case "$rc" in
-      0) msg_ok "The VM disk has a partition table: the install wrote to it"; return 0 ;;
-      2) msg_warn "Could not inspect the VM disk on this storage type; trusting you that the install finished."; return 0 ;;
-      *) msg_warn "The VM disk is still empty, so the install has not finished (or not started)."
-         echo "   Finish the installer in the console first, then press Enter again." ;;
+    rc=0; read -r -t 30 _ || rc=$?
+    if ((rc > 128)); then         # timed out: just report status
+      install_status "$start"; continue
+    elif ((rc != 0)); then        # stdin closed: avoid a busy loop
+      sleep 30; install_status "$start"; continue
+    fi
+    echo
+    echo " Has the installer shown \"Installation complete\"?"
+    echo "   y = yes, continue (eject the ISO and reboot into Lubuntu)"
+    echo "   w = not yet, keep waiting"
+    echo "   n = no, ABORT: stop and delete VM ${VMID} and its disks"
+    read -r -p " Choice [y/w/n]: " ans
+    case "${ans,,}" in
+      y|yes)
+        # Don't take the answer on trust: an empty disk means the installer
+        # has not run, and rebooting would land in the UEFI boot menu.
+        rc=0; disk_has_os || rc=$?
+        case "$rc" in
+          0) msg_ok "The VM disk has partitions: the install wrote to it"; return 0 ;;
+          2) msg_warn "Cannot inspect the disk on this storage type; continuing on your word."; return 0 ;;
+          *) msg_warn "The VM disk is still empty, so the install has not run. Still waiting." ;;
+        esac ;;
+      n|no) abort_install "Install aborted at your request." ;;
+      *) echo " Still waiting." ;;
     esac
+    install_status "$start"
   done
+}
+
+# Abort: optionally stop and destroy the VM this script created (with its
+# disks), then exit. The ISO and the log are kept.
+abort_install() {
+  local reason="$1" ans
+  echo
+  msg_warn "$reason"
+  if [[ -n "${VMID:-}" && -e "/etc/pve/qemu-server/${VMID}.conf" && "${VM_CREATED:-no}" == "yes" ]]; then
+    read -r -p " Delete VM ${VMID} (${HN}) and all its disks? [y/N]: " ans
+    if [[ "${ans,,}" == y || "${ans,,}" == yes ]]; then
+      msg_info "Stopping VM ${VMID}"
+      qm stop "$VMID" >/dev/null 2>&1 || true
+      msg_info "Destroying VM ${VMID} and its disks"
+      if qm destroy "$VMID" --purge 1 --destroy-unreferenced-disks 1 >/dev/null 2>&1; then
+        msg_ok "VM ${VMID} and its disks were removed"
+      else
+        msg_error "Could not destroy VM ${VMID}; remove it in the web UI."
+      fi
+    else
+      msg_ok "VM ${VMID} was left as it is."
+    fi
+  fi
+  echo "   The ISO stays in storage. Log: ${LOG_FILE}"
+  exit 1
 }
 
 # Check the VM's system disk from the host (read-only).
@@ -527,7 +597,7 @@ Screenshot saved in ${LOG_DIR}." 15 78 3 \
         manual_install_handoff
         eject_and_reboot
         return 0 ;;
-      *) msg_error "Stopped: the VM did not boot. Log: ${LOG_FILE}"; exit 1 ;;
+      *) abort_install "Stopped: the VM did not boot." ;;
     esac
   done
 }
@@ -716,8 +786,7 @@ EOF
         TYPED_AT=$(date +%s)
         msg_info "Waiting for you to run it; the VM reboots when it finishes" ;;
       *)
-        msg_error "Stopped at the guest agent step. Log: ${LOG_FILE}"
-        exit 1 ;;
+        abort_install "Stopped at the guest agent step." ;;
     esac
   done
 }
