@@ -73,6 +73,7 @@ MAC="02:$(openssl rand -hex 5 | tr '[:lower:]' '[:upper:]' | sed 's/\(..\)/\1:/g
 VLAN=""
 MTU=""
 KEYBOARD=""
+DISPLAY_TYPE="std"        # VGA: std (Proxmox default), virtio (VirtIO-GPU), qxl (SPICE)
 VERBOSE="no"
 START_VM="yes"
 VM_CREATED="no"           # set once qm create succeeds; lets abort clean up
@@ -316,6 +317,10 @@ advanced_settings() {
   v="$(wt --title "MTU SIZE" --inputbox "Set interface MTU (leave blank for default)" 8 58 "")" || exit_script
   MTU="${v:+,mtu=$v}"
 
+  DISPLAY_TYPE="$(wt --title "DISPLAY" --radiolist \
+    "Graphic card. Try VirtIO-GPU if the console says the display is not initialized." 12 70 3 \
+    "std" "Standard VGA (default)" ON "virtio" "VirtIO-GPU" OFF "qxl" "SPICE (qxl)" OFF)" || exit_script
+
   KEYBOARD="$(wt --title "KEYBOARD" --inputbox \
     "Console keyboard layout (blank = Proxmox default).\nNote: the auto-login step types with a US layout." 10 58 "")" || exit_script
 
@@ -420,7 +425,7 @@ create_vm() {
     --scsi0 "${STORAGE}:${DISK_SIZE},discard=on,ssd=1,iothread=1${cache_opt}" \
     --ide2 "${ISO_STORAGE}:iso/${ISO_NAME},media=cdrom" \
     --boot "order=ide2;scsi0" \
-    --agent enabled=1 --vga std --tablet 1 --onboot 0 \
+    --agent enabled=1 --vga "$DISPLAY_TYPE" --tablet 1 --onboot 0 \
     --tags lubuntu --description "Lubuntu ${LUBUNTU_SERIES} desktop, created by lubuntu-vm.sh" \
     $kb_opt >/dev/null
 
@@ -464,19 +469,27 @@ install_status() {
   local start="$1" elapsed json state written parts rc
   elapsed=$(( $(date +%s) - start ))
   json="$(pvesh get "/nodes/$(hostname)/qemu/${VMID}/status/current" --output-format json 2>/dev/null || echo '{}')"
-  state="$(perl -MJSON -0777 -ne 'my $j = decode_json($_); print $j->{status} // "unknown"' <<<"$json")"
+  # qmpstatus is QEMU's own view (running / paused / prelaunch / ...).
+  state="$(perl -MJSON -0777 -ne 'my $j = decode_json($_); print $j->{qmpstatus} // $j->{status} // "unknown"' <<<"$json")"
   written="$(perl -MJSON -0777 -ne 'my $j = decode_json($_); my $b = $j->{blockstat}{scsi0}{wr_bytes} // 0;
     printf "%.1f GiB", $b / 1073741824' <<<"$json")"
   rc=0; disk_has_os || rc=$?
   case "$rc" in 0) parts="yes" ;; 1) parts="none yet" ;; *) parts="unknown" ;; esac
   printf ' [%02d:%02d] VM %s | written to disk: %s | partitions: %s\n' \
     $((elapsed / 60)) $((elapsed % 60)) "$state" "$written" "$parts"
+  # A console screenshot every 2 minutes, so a stuck installer can be seen
+  # in the log folder afterwards.
+  if ((elapsed >= 30 && elapsed / 120 != ${LAST_INSTALL_SHOT:--1})); then
+    LAST_INSTALL_SHOT=$((elapsed / 120))
+    screenshot install
+  fi
 }
 
 # Wait for the manual install with a status line every 30 seconds. Enter
 # opens a plain prompt: continue, keep waiting, or abort and clean up.
 wait_for_install() {
   local start ans rc
+  LAST_INSTALL_SHOT=-1
   start=$(date +%s)
   install_status "$start"
   while true; do
@@ -973,7 +986,7 @@ Choose No for advanced settings." 13 64; then
   echo -e " ISO:   ${ISO_NAME}"
   echo -e " SSH:   key $([[ -n "$SSH_PUBKEY" ]] && echo yes || echo no), PermitRootLogin ${PERMIT_ROOT}"
   echo -e " Root:  password $([[ -n "$ROOT_PW" ]] && echo set || echo "not set")"
-  echo -e " xrdp:  flags '${XRDP_FLAGS:-none}'"
+  echo -e " xrdp:  flags '${XRDP_FLAGS:-none}'   Display: ${DISPLAY_TYPE}"
   echo
 
   create_vm
