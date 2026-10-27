@@ -18,8 +18,8 @@ bash lubuntu-vm.sh
    - Defaults: q35, UEFI, 30 GiB disk on `local-lvm`, cache none, 2 cores, `vmbr0`, and RAM picked from 4/8/12/16 GB or custom (8 GB preselected).
    - Advanced: VM ID, machine type, firmware, disk size, cache, storage, hostname, CPU model, cores, RAM, bridge, MAC, VLAN, MTU, keyboard, verbose mode and start VM.
    - Then: the password for `sadmin`, an optional SSH public key (a file path or the pasted key), optional `PermitRootLogin yes` (with a security warning), an optional root password (asked twice, and it must be different from sadmin's), and xrdp options (sound redirection `-s`, custom login screen `-l`).
-4. **Manual install.** The VM boots the ISO. In the Proxmox console, install Lubuntu with username **sadmin** and the same password. When the installer finishes, **don't click Restart**. Go back to the script and press Enter.
-5. **Console bootstrap.** The script ejects the ISO and reboots the VM. Using `qm sendkey`, it then logs in at the console, opens a terminal (Ctrl+Alt+T) and installs `qemu-guest-agent` and `openssh-server`. If that fails twice, it shows you the command to run by hand.
+4. **Manual install.** The VM boots the ISO. In the Proxmox console, install Lubuntu with username **sadmin**, the same password and an English (US) keyboard. When the installer finishes, **don't click Restart**. Go back to the script and press Enter.
+5. **Console bootstrap.** The script ejects the ISO and reboots the VM. Using `qm sendkey`, it logs in at the console, opens a terminal (Ctrl+Alt+T) and types `sudo apt-get update && sudo apt-get install -y qemu-guest-agent openssh-server && sudo reboot`. The VM reboots by itself when the install finishes, and the script then checks for the guest agent (up to 15 minutes, with a progress counter). If the agent doesn't answer, a menu lets you keep waiting, retry, run the command yourself, or stop. Each wait shows a countdown that you can skip with Enter.
 6. **Post-install** (through `qm guest exec`, as root in the guest):
    - install nala, then `nala upgrade -y`
    - OpenSSH: upload the key to sadmin (and to root if root login is on), add `PermitRootLogin yes` in `/etc/ssh/sshd_config.d/10-permit-root-login.conf` if you chose it, and set the root password if you gave one
@@ -31,7 +31,8 @@ bash lubuntu-vm.sh
 ## Notes and limitations
 
 - `qm sendkey` types using a US keyboard layout. Keep the guest keyboard set to English (US) in the installer, or the password will be mistyped.
-- If you tick *Log in automatically* in the installer, the script asks about it and skips typing the password.
-- Everything that runs inside the guest is logged to `/var/log/lubuntu-vm-setup.log`.
+- Leave *Log in automatically* unticked in the installer. If you tick it anyway, the typed password just lands on the empty desktop, which is harmless.
+- The sadmin password may only use letters, digits, spaces and US-keyboard symbols, because the script types it into the console.
+- **Logs.** Everything shown on screen is logged on the host to `/var/log/lubuntu-vm/lubuntu-vm-<date>.log`. The directory is mode 700 and the files are 600. Passwords are never printed, and menus and password boxes are drawn straight on the terminal, so no password reaches the log. Console screenshots from the auto-login step are saved next to the log so you can see where it got stuck. Commands run inside the guest are logged to `/var/log/lubuntu-vm-setup.log` in the VM.
 - The c-nergy installer officially lists standard Ubuntu 22.04 to 25.x. It may complain about Lubuntu or 26.04, which is why the xrdp step does not stop the script when it fails.
 - `PermitRootLogin yes` exposes root to brute-force attempts. Only use it on a trusted network, and prefer key login.

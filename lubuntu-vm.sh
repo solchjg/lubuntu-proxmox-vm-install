@@ -30,6 +30,10 @@
 #   * The VM needs internet access through the chosen bridge.
 #   * Everything that runs inside the guest is logged to
 #     /var/log/lubuntu-vm-setup.log in the guest.
+#   * Everything shown on screen is also logged on the host to
+#     /var/log/lubuntu-vm/lubuntu-vm-<date>.log (root-only, 0600), together
+#     with console screenshots taken during the auto-login step. Passwords
+#     are never printed, so they never reach the log.
 # =============================================================================
 
 set -Eeuo pipefail
@@ -45,6 +49,8 @@ VM_USER="sadmin"
 SNAPSHOT_NAME="initial-install"
 ISO_STORAGE="local"                       # Proxmox storage that holds ISOs
 GUEST_LOG="/var/log/lubuntu-vm-setup.log" # log file inside the guest
+LOG_DIR="/var/log/lubuntu-vm"              # host log directory (root only)
+LOG_FILE="${LOG_DIR}/lubuntu-vm-$(date +%Y%m%d-%H%M%S).log"
 TEMP_DIR="$(mktemp -d)"
 
 # Colours for status messages
@@ -76,7 +82,6 @@ SSH_PUBKEY=""
 PERMIT_ROOT="no"
 ROOT_PW=""                # optional root password; must differ from VM_PASSWORD
 XRDP_FLAGS="-s"           # c-nergy switches: -s sound redirection, -l custom login screen
-AUTOLOGIN="no"
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -87,6 +92,21 @@ msg_warn()  { echo -e " ${YW}!${CL} ${YW}$*${CL}"; }
 msg_error() { echo -e " ${RD}✗ $*${CL}" >&2; }
 
 cleanup() { rm -rf "$TEMP_DIR"; }
+
+# Copy everything printed to stdout/stderr into LOG_FILE, with colour codes
+# stripped. The directory and file are readable by root only. whiptail draws
+# straight on /dev/tty (see wt), so menus and password boxes never reach the
+# log, and the script never echoes a password.
+start_logging() {
+  umask 077
+  mkdir -p "$LOG_DIR"
+  chmod 700 "$LOG_DIR"
+  : >"$LOG_FILE"
+  chmod 600 "$LOG_FILE"
+  exec > >(tee >(sed -u -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\x1b[()][A-Z0-9]//g' >>"$LOG_FILE")) 2>&1
+  echo "=== lubuntu-vm.sh started $(date '+%F %T') on $(hostname) ==="
+  umask 022   # back to normal for the ISO and anything else the script writes
+}
 trap cleanup EXIT
 trap 'msg_error "Failed at line $LINENO: $BASH_COMMAND"' ERR
 
@@ -179,7 +199,7 @@ ensure_iso() {
     msg_ok "ISO already present and verified: ${ISO_PATH}"
   else
     msg_info "Downloading ${ISO_URL}"
-    curl -fL --progress-bar -o "${ISO_PATH}.part" "$ISO_URL"
+    curl -fL --progress-bar -o "${ISO_PATH}.part" "$ISO_URL" 2>/dev/tty
     msg_info "Verifying SHA256 checksum"
     if ! echo "${ISO_SHA256}  ${ISO_PATH}.part" | sha256sum -c --status; then
       rm -f "${ISO_PATH}.part"
@@ -216,7 +236,9 @@ get_valid_nextid() {
 }
 
 # Wrapper so every menu has the same backtitle and exits cleanly on Cancel.
-wt() { whiptail --backtitle "Proxmox VE Helper - Lubuntu ${LUBUNTU_SERIES} VM" "$@" 3>&1 1>&2 2>&3; }
+# whiptail draws on /dev/tty (so menus stay out of the log) and returns the
+# selection on stdout.
+wt() { whiptail --backtitle "Proxmox VE Helper - Lubuntu ${LUBUNTU_SERIES} VM" "$@" 3>&1 1>/dev/tty 2>&3; }
 
 select_ram() {
   local choice
@@ -315,6 +337,8 @@ ask_password() {
       wt --title "ERROR" --msgbox "Password cannot be empty." 8 40
     elif [[ "$p1" != "$p2" ]]; then
       wt --title "ERROR" --msgbox "Passwords do not match." 8 40
+    elif ! typeable "$p1"; then
+      wt --title "ERROR" --msgbox "Use only letters, digits, spaces and US-keyboard symbols:\nthe script types this password into the VM console." 9 64
     elif [[ -n "$forbidden" && "$p1" == "$forbidden" ]]; then
       wt --title "ERROR" --msgbox "The root password must be different from ${VM_USER}'s password." 8 64
     else
@@ -338,7 +362,7 @@ post_install_settings() {
   elif [[ "$key" =~ ^(ssh-|ecdsa-|sk-) ]]; then
     SSH_PUBKEY="$key"
   elif [[ -n "$key" ]]; then
-    msg_warn "'${key}' is neither a file nor a public key; skipping key upload."
+    msg_warn "That input is neither a file nor a public key; skipping key upload."
   fi
 
   if wt --title "PERMIT ROOT LOGIN" --defaultno --yesno \
@@ -420,16 +444,12 @@ manual_install_handoff() {
    * Your name / username:  ${BOLD}${VM_USER}${CL}
    * Computer name:         ${BOLD}${HN}${CL}
    * Password:              the password you just entered in this script
+   * Keyboard layout:       English (US)
    * When it says the installation is complete, ${BOLD}do NOT click Restart${CL}.
      Come back here instead.
 
 EOF
   read -r -p " Press Enter once the installer reports it has finished... " _
-
-  if wt --title "AUTO LOGIN" --defaultno --yesno \
-    "Did you tick 'Log in automatically' in the installer?" 8 60; then
-    AUTOLOGIN="yes"
-  fi
 }
 
 eject_and_reboot() {
@@ -474,76 +494,150 @@ key_for_char() {
 type_text() {
   local text="$1" i key
   for ((i = 0; i < ${#text}; i++)); do
-    key="$(key_for_char "${text:i:1}")" || { msg_error "Cannot type character '${text:i:1}' via sendkey"; return 1; }
+    key="$(key_for_char "${text:i:1}")" || { msg_error "Text contains a character sendkey cannot type"; return 1; }
     qm sendkey "$VMID" "$key"
+  done
+}
+
+# True if every character of $1 can be typed with qm sendkey.
+typeable() {
+  local text="$1" i
+  for ((i = 0; i < ${#text}; i++)); do
+    key_for_char "${text:i:1}" >/dev/null || return 1
   done
 }
 
 guest_agent_up() { qm guest cmd "$VMID" ping >/dev/null 2>&1; }
 
-# Wait up to $1 seconds for the guest agent to answer.
-wait_for_agent() {
-  local timeout="$1" waited=0
-  while ((waited < timeout)); do
-    guest_agent_up && return 0
-    sleep 5; waited=$((waited + 5))
-  done
-  return 1
+# Save a PNG screenshot of the VM console into the log directory, so a
+# failed auto-login can be diagnosed afterwards. Never fatal.
+SHOT_NO=0
+screenshot() {
+  SHOT_NO=$((SHOT_NO + 1))
+  local file
+  file="${LOG_DIR}/vm${VMID}-$(date +%H%M%S)-${SHOT_NO}-$1.png"
+  if pvesh create "/nodes/$(hostname)/qemu/${VMID}/monitor" \
+    --command "screendump ${file} -f png" >/dev/null 2>&1 && [[ -s "$file" ]]; then
+    chmod 600 "$file"
+    echo "   screenshot: ${file}"
+  fi
+  return 0
 }
 
-# Log in at the console, open a terminal and install the guest agent + SSH.
-console_bootstrap() {
-  local bootstrap_cmd="sudo apt-get update && sudo apt-get install -y qemu-guest-agent openssh-server && sudo systemctl start qemu-guest-agent"
-  local attempt
+# Sleep up to $1 seconds showing a countdown; Enter skips the rest.
+countdown() {
+  local secs="$1" msg="$2"
+  while ((secs > 0)); do
+    printf '\r   %s: %3ss left (Enter to skip) ' "$msg" "$secs" >/dev/tty
+    if read -r -t 1 _ </dev/tty; then break; fi
+    secs=$((secs - 1))
+  done
+  printf '\r%*s\r' 70 '' >/dev/tty
+}
 
-  for attempt in 1 2; do
-    echo
-    msg_info "Waiting for the login screen (press Enter to continue sooner)"
-    read -r -t 90 -p "  " _ || true
+# Seconds since the guest booted, as reported through the guest agent.
+guest_uptime() {
+  qm guest exec "$VMID" --timeout 15 -- cat /proc/uptime 2>/dev/null \
+    | perl -MJSON -0777 -ne 'my $j = decode_json($_); my ($u) = split / /, ($j->{"out-data"} // ""); print int($u || 0)'
+}
 
-    if [[ "$AUTOLOGIN" == "no" ]]; then
-      msg_info "Logging in as ${VM_USER} at the console"
-      qm sendkey "$VMID" shift          # wake the screen
-      sleep 2
-      type_text "$VM_PASSWORD"
-      qm sendkey "$VMID" ret
-      msg_info "Waiting for the desktop to load"
-      sleep 40
+# Wait up to $1 seconds for the guest agent to answer *after* the reboot
+# that ends the bootstrap command typed at epoch second $2. Shows progress.
+wait_for_agent_after_reboot() {
+  local timeout="$1" typed_at="$2" start now up
+  start=$(date +%s)
+  while true; do
+    now=$(date +%s)
+    ((now - start < timeout)) || { echo >/dev/tty; return 1; }
+    printf '\r   waiting for the guest agent: %4ss elapsed ' "$((now - start))" >/dev/tty
+    if guest_agent_up; then
+      up="$(guest_uptime || true)"
+      # Booted after the command was typed: the install and reboot are done.
+      if [[ -n "$up" && "$up" -gt 0 && "$up" -lt $((now - typed_at)) ]]; then
+        echo >/dev/tty
+        return 0
+      fi
     fi
+    sleep 10
+  done
+}
 
-    msg_info "Opening a terminal and installing qemu-guest-agent + openssh-server"
-    qm sendkey "$VMID" ctrl-alt-t
-    sleep 8
-    type_text "$bootstrap_cmd"
-    qm sendkey "$VMID" ret
-    sleep 4
-    type_text "$VM_PASSWORD"            # sudo password prompt
-    qm sendkey "$VMID" ret
+# Log in at the console, open a terminal and type a command that installs
+# the guest agent + SSH server and then reboots the VM. The script does not
+# wait for the agent inside that session: it checks for it after the reboot,
+# when the agent starts normally at boot.
+BOOTSTRAP_CMD="sudo apt-get update && sudo apt-get install -y qemu-guest-agent openssh-server && sudo reboot"
 
-    msg_info "Waiting for the guest agent to come online (up to 10 minutes)"
-    if wait_for_agent 600; then
-      msg_ok "Guest agent is running"
+type_bootstrap() {
+  countdown 120 "Waiting for the login screen"
+  screenshot login-screen
+
+  # Log in. If auto-login was ticked in the installer this just types into
+  # the empty desktop, which is harmless.
+  msg_info "Logging in as ${VM_USER} at the console"
+  qm sendkey "$VMID" ctrl            # wake the screen / focus the password box
+  sleep 2
+  type_text "$VM_PASSWORD"
+  qm sendkey "$VMID" ret
+  countdown 60 "Waiting for the desktop"
+  screenshot desktop
+
+  msg_info "Opening a terminal (Ctrl+Alt+T)"
+  qm sendkey "$VMID" ctrl-alt-t
+  sleep 10
+  screenshot terminal
+
+  msg_info "Typing: ${BOOTSTRAP_CMD}"
+  TYPED_AT=$(date +%s)
+  type_text "$BOOTSTRAP_CMD"
+  qm sendkey "$VMID" ret
+  sleep 5
+  type_text "$VM_PASSWORD"           # answers the sudo prompt
+  qm sendkey "$VMID" ret
+  sleep 15
+  screenshot after-sudo
+  msg_ok "Command sent. The VM will install the packages and reboot by itself."
+}
+
+console_bootstrap() {
+  local choice
+  type_bootstrap
+  while true; do
+    msg_info "Checking for the guest agent after the VM reboots (up to 15 minutes)"
+    if wait_for_agent_after_reboot 900 "$TYPED_AT"; then
+      msg_ok "Guest agent is running after the reboot"
       return 0
     fi
-    msg_warn "Guest agent did not answer (attempt ${attempt}/2)."
-    if [[ $attempt -eq 1 ]]; then
-      msg_info "Retrying after a reboot"
-      qm reboot "$VMID" >/dev/null 2>&1 || { qm stop "$VMID"; qm start "$VMID"; }
-    fi
-  done
+    msg_warn "The guest agent has not answered yet."
+    screenshot no-agent
+    choice="$(wt --title "GUEST AGENT NOT FOUND" --menu \
+"The guest agent did not answer within 15 minutes.
+Look at the VM console to see what happened. Screenshots are in ${LOG_DIR}." 16 76 4 \
+      "wait"   "Keep waiting another 15 minutes" \
+      "retry"  "Reboot the VM and type the command again" \
+      "manual" "I will run the command in the console myself" \
+      "abort"  "Stop the script (the VM is left as it is)")" || choice="abort"
+    case "$choice" in
+      wait) ;;
+      retry)
+        msg_info "Rebooting VM ${VMID} and trying again"
+        qm reboot "$VMID" --timeout 120 >/dev/null 2>&1 || { qm stop "$VMID" >/dev/null; qm start "$VMID"; }
+        type_bootstrap ;;
+      manual)
+        cat <<EOF
 
-  # Last resort: ask the user to run the command by hand.
-  cat <<EOF
+ In the VM console, log in as ${VM_USER}, open a terminal (Ctrl+Alt+T) and run:
 
- ${YW}The automatic console login did not work.${CL}
- Please open the VM console, log in as ${VM_USER}, open a terminal and run:
-
-   ${BOLD}${bootstrap_cmd}${CL}
+   ${BOLD}${BOOTSTRAP_CMD}${CL}
 
 EOF
-  read -r -p " Press Enter when that has finished... " _
-  wait_for_agent 300 || { msg_error "Guest agent still not reachable. Stopping."; exit 1; }
-  msg_ok "Guest agent is running"
+        TYPED_AT=$(date +%s)
+        msg_info "Waiting for you to run it; the VM reboots when it finishes" ;;
+      *)
+        msg_error "Stopped at the guest agent step. Log: ${LOG_FILE}"
+        exit 1 ;;
+    esac
+  done
 }
 
 # -----------------------------------------------------------------------------
@@ -704,6 +798,8 @@ shutdown_and_snapshot() {
 main() {
   header_info
   preflight
+  start_logging
+  msg_ok "Logging to ${BL}${LOG_FILE}${CL}"
   ensure_iso
 
   if wt --title "SETTINGS" --yesno \
@@ -748,6 +844,7 @@ Choose No for advanced settings." 13 64; then
   if [[ "$PERMIT_ROOT" == "yes" ]]; then
     msg_warn "Reminder: PermitRootLogin yes is enabled. Keep this VM on a trusted network."
   fi
+  echo "   Log file: ${LOG_FILE}"
 }
 
 main "$@"
