@@ -74,7 +74,7 @@ START_VM="yes"
 VM_PASSWORD=""
 SSH_PUBKEY=""
 PERMIT_ROOT="no"
-ROOT_PASSWORD="no"
+ROOT_PW=""                # optional root password; must differ from VM_PASSWORD
 XRDP_FLAGS="-s"           # c-nergy switches: -s sound redirection, -l custom login screen
 AUTOLOGIN="no"
 
@@ -303,20 +303,30 @@ advanced_settings() {
 }
 
 # Questions about the guest setup (password, SSH, xrdp).
-post_install_settings() {
-  local p1 p2
+# Ask for a password twice until both entries match and pass the checks.
+#   ask_password <title> <prompt> [password it must differ from]
+# The result is left in PASSWORD_RESULT.
+ask_password() {
+  local title="$1" prompt="$2" forbidden="${3:-}" p1 p2
   while true; do
-    p1="$(wt --title "PASSWORD FOR ${VM_USER}" --passwordbox \
-      "Password for user '${VM_USER}'.\nUse the same password when the Lubuntu installer asks." 10 60)" || exit_script
-    p2="$(wt --title "PASSWORD FOR ${VM_USER}" --passwordbox "Confirm password" 8 60)" || exit_script
+    p1="$(wt --title "$title" --passwordbox "$prompt" 10 64)" || exit_script
+    p2="$(wt --title "$title" --passwordbox "Confirm password" 8 64)" || exit_script
     if [[ -z "$p1" ]]; then
       wt --title "ERROR" --msgbox "Password cannot be empty." 8 40
     elif [[ "$p1" != "$p2" ]]; then
       wt --title "ERROR" --msgbox "Passwords do not match." 8 40
+    elif [[ -n "$forbidden" && "$p1" == "$forbidden" ]]; then
+      wt --title "ERROR" --msgbox "The root password must be different from ${VM_USER}'s password." 8 64
     else
-      VM_PASSWORD="$p1"; break
+      PASSWORD_RESULT="$p1"; return 0
     fi
   done
+}
+
+post_install_settings() {
+  ask_password "PASSWORD FOR ${VM_USER}" \
+    "Password for user '${VM_USER}'.\nUse the same password when the Lubuntu installer asks."
+  VM_PASSWORD="$PASSWORD_RESULT"
 
   # Optional public key: a file path on this host, or the key pasted in.
   local key
@@ -343,17 +353,27 @@ Enable PermitRootLogin yes anyway?" 14 76 && PERMIT_ROOT="yes"
   fi
   if [[ "$PERMIT_ROOT" == "yes" ]]; then
     msg_warn "PermitRootLogin yes will be enabled. Use only on a trusted network."
-    if wt --title "ROOT PASSWORD" --defaultno --yesno \
-      "Ubuntu's root account has no password, so root can only log in with a key.\n\nSet root's password to the same as ${VM_USER}'s?" 11 70; then
-      ROOT_PASSWORD="yes"
-    fi
   fi
 
+  # Optional root password. Ubuntu leaves root without one (locked).
+  if wt --title "ROOT PASSWORD" --defaultno --yesno \
+    "Ubuntu's root account has no password by default.\n\nSet a root password? It must be different from ${VM_USER}'s." 11 70; then
+    ask_password "ROOT PASSWORD" "Password for root (must differ from ${VM_USER}'s)." "$VM_PASSWORD"
+    ROOT_PW="$PASSWORD_RESULT"
+  elif [[ "$PERMIT_ROOT" == "yes" && -z "$SSH_PUBKEY" ]]; then
+    msg_warn "PermitRootLogin yes without a root password or SSH key: root still cannot log in over SSH."
+  fi
+
+  # whiptail treats tags starting with '-' as its own options and exits, so
+  # the menu uses plain words and they are mapped to installer switches.
   local flags
   flags="$(wt --title "XRDP OPTIONS" --checklist "c-nergy xrdp installer options" 11 64 2 \
-    "-s" "Enable sound redirection" ON \
-    "-l" "Customise the xrdp login screen" OFF)" || exit_script
-  XRDP_FLAGS="$(echo "$flags" | tr -d '"')"
+    "sound" "Enable sound redirection (-s)" ON \
+    "login" "Customise the xrdp login screen (-l)" OFF)" || exit_script
+  XRDP_FLAGS=""
+  [[ "$flags" == *sound* ]] && XRDP_FLAGS+="-s "
+  [[ "$flags" == *login* ]] && XRDP_FLAGS+="-l "
+  XRDP_FLAGS="${XRDP_FLAGS% }"
 }
 
 # -----------------------------------------------------------------------------
@@ -572,8 +592,7 @@ exec > >(tee -a ${GUEST_LOG}) 2>&1
 VM_USER=$(printf '%q' "$VM_USER")
 SSH_PUBKEY=$(printf '%q' "$SSH_PUBKEY")
 PERMIT_ROOT=$(printf '%q' "$PERMIT_ROOT")
-ROOT_PASSWORD=$(printf '%q' "$ROOT_PASSWORD")
-VM_PASSWORD=$(printf '%q' "$VM_PASSWORD")
+ROOT_PW=$(printf '%q' "$ROOT_PW")
 
 apt-get install -y openssh-server
 add_key() {   # add_key <home> <owner>
@@ -587,7 +606,9 @@ if [ -n "\$SSH_PUBKEY" ]; then
 fi
 if [ "\$PERMIT_ROOT" = yes ]; then
   echo "PermitRootLogin yes" >/etc/ssh/sshd_config.d/10-permit-root-login.conf
-  [ "\$ROOT_PASSWORD" = yes ] && echo "root:\$VM_PASSWORD" | chpasswd
+fi
+if [ -n "\$ROOT_PW" ]; then
+  echo "root:\$ROOT_PW" | chpasswd
 fi
 systemctl enable --now ssh
 systemctl restart ssh
@@ -704,7 +725,8 @@ Choose No for advanced settings." 13 64; then
   echo -e "        ${DISK_SIZE} GiB on ${STORAGE} (cache ${DISK_CACHE}), ${BRG} ${MAC}${VLAN}${MTU}"
   echo -e " ISO:   ${ISO_NAME}"
   echo -e " SSH:   key $([[ -n "$SSH_PUBKEY" ]] && echo yes || echo no), PermitRootLogin ${PERMIT_ROOT}"
-  echo -e " xrdp:  flags '${XRDP_FLAGS}'"
+  echo -e " Root:  password $([[ -n "$ROOT_PW" ]] && echo set || echo "not set")"
+  echo -e " xrdp:  flags '${XRDP_FLAGS:-none}'"
   echo
 
   create_vm

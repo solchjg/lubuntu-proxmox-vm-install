@@ -17,12 +17,12 @@ bash lubuntu-vm.sh
 3. **Settings.** Choose *default* or *advanced*.
    - Defaults: q35, UEFI, 30 GiB disk on `local-lvm`, cache none, 2 cores, `vmbr0`, and RAM picked from 4/8/12/16 GB or custom (8 GB preselected).
    - Advanced: VM ID, machine type, firmware, disk size, cache, storage, hostname, CPU model, cores, RAM, bridge, MAC, VLAN, MTU, keyboard, verbose mode and start VM.
-   - Then: the password for `sadmin`, an optional SSH public key (a file path or the pasted key), optional `PermitRootLogin yes` (with a security warning and an option to give root the same password), and xrdp options (`-s` sound, `-l` custom login screen).
+   - Then: the password for `sadmin`, an optional SSH public key (a file path or the pasted key), optional `PermitRootLogin yes` (with a security warning), an optional root password (asked twice, and it must be different from sadmin's), and xrdp options (sound redirection `-s`, custom login screen `-l`).
 4. **Manual install.** The VM boots the ISO. In the Proxmox console, install Lubuntu with username **sadmin** and the same password. When the installer finishes, **don't click Restart**. Go back to the script and press Enter.
 5. **Console bootstrap.** The script ejects the ISO and reboots the VM. Using `qm sendkey`, it then logs in at the console, opens a terminal (Ctrl+Alt+T) and installs `qemu-guest-agent` and `openssh-server`. If that fails twice, it shows you the command to run by hand.
 6. **Post-install** (through `qm guest exec`, as root in the guest):
    - install nala, then `nala upgrade -y`
-   - OpenSSH: upload the key to sadmin (and to root if root login is on), add `PermitRootLogin yes` in `/etc/ssh/sshd_config.d/10-permit-root-login.conf` if you chose it
+   - OpenSSH: upload the key to sadmin (and to root if root login is on), add `PermitRootLogin yes` in `/etc/ssh/sshd_config.d/10-permit-root-login.conf` if you chose it, and set the root password if you gave one
    - enable qemu-guest-agent
    - download the newest `xrdp-installer-X.Y.zip` from c-nergy.be (1.6 is the fallback) and run it as sadmin. sadmin gets passwordless sudo only for this step, and it is removed afterwards. If this step fails, the script warns you and carries on.
    - check that SSH answers on the VM's IP
