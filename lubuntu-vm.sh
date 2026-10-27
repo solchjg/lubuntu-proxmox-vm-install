@@ -153,7 +153,7 @@ preflight() {
       "This script was written for Proxmox VE 9.\nContinue anyway?" 9 50 || exit_script
   fi
   local tool
-  for tool in curl whiptail sha256sum perl qm pvesm pvesh; do
+  for tool in curl whiptail sha256sum perl qm pvesm pvesh blkid partx; do
     command -v "$tool" >/dev/null 2>&1 || { msg_error "Missing required tool: $tool"; exit 1; }
   done
 }
@@ -449,7 +449,87 @@ manual_install_handoff() {
      Come back here instead.
 
 EOF
-  read -r -p " Press Enter once the installer reports it has finished... " _
+  # Don't take the user's word for it: an empty disk means the installer has
+  # not run (or not got far), and rebooting would land in the UEFI menu.
+  local rc
+  while true; do
+    read -r -p " Press Enter once the installer reports it has finished... " _
+    rc=0; disk_has_os || rc=$?
+    case "$rc" in
+      0) msg_ok "The VM disk has a partition table: the install wrote to it"; return 0 ;;
+      2) msg_warn "Could not inspect the VM disk on this storage type; trusting you that the install finished."; return 0 ;;
+      *) msg_warn "The VM disk is still empty, so the install has not finished (or not started)."
+         echo "   Finish the installer in the console first, then press Enter again." ;;
+    esac
+  done
+}
+
+# Check the VM's system disk from the host (read-only).
+#   0 = has a partition table with at least 2 partitions (Lubuntu: ESP + root)
+#   1 = empty / no partitions
+#   2 = cannot tell (not a block device, e.g. qcow2 on directory storage)
+disk_has_os() {
+  local volid dev parts
+  volid="$(qm config "$VMID" | sed -n 's/^scsi0: \([^,]*\).*/\1/p')"
+  dev="$(pvesm path "$volid" 2>/dev/null)" || return 2
+  [[ -b "$dev" ]] || return 2
+  blkid -p -s PTTYPE -o value "$dev" >/dev/null 2>&1 || return 1
+  parts="$(partx -g -o NR "$dev" 2>/dev/null | wc -l)"
+  ((parts >= 2)) || return 1
+  return 0
+}
+
+# Wait until the installed OS is up, judged by network traffic from the VM:
+# the UEFI firmware sends nothing (the NIC is not in the boot order), while
+# Ubuntu asks for a DHCP lease as soon as it boots. The tap device is created
+# fresh on every VM start, so its counter starts at 0.
+wait_for_os_boot() {
+  local timeout="$1" start now rx stats="/sys/class/net/tap${VMID}i0/statistics/rx_packets"
+  start=$(date +%s)
+  msg_info "Waiting for the installed system to boot (up to $((timeout / 60)) minutes)"
+  while true; do
+    now=$(date +%s)
+    rx=$(cat "$stats" 2>/dev/null || echo 0)
+    printf '\r   packets from the VM: %4s, %4ss elapsed ' "$rx" "$((now - start))" >/dev/tty
+    if ((rx >= 10)); then
+      echo >/dev/tty
+      msg_ok "The installed system is up (its network is active)"
+      return 0
+    fi
+    if ((now - start >= timeout)); then
+      echo >/dev/tty
+      return 1
+    fi
+    sleep 5
+  done
+}
+
+# Boot from disk and make sure it worked. If it did not, offer to go back to
+# the installer instead of typing keystrokes into the firmware menu.
+boot_installed_system() {
+  local choice
+  while true; do
+    wait_for_os_boot 300 && return 0
+    screenshot boot-failed
+    msg_error "The VM did not boot from its disk."
+    choice="$(wt --title "VM DID NOT BOOT" --menu \
+"No sign of the installed system after 5 minutes. The console probably shows
+'No bootable option or device was found', meaning the install did not finish.
+Screenshot saved in ${LOG_DIR}." 15 78 3 \
+      "reinstall" "Re-attach the ISO and run the installer again" \
+      "wait"      "Keep waiting another 5 minutes" \
+      "abort"     "Stop the script (the VM is left as it is)")" || choice="abort"
+    case "$choice" in
+      wait) ;;
+      reinstall)
+        qm stop "$VMID" >/dev/null 2>&1 || true
+        qm set "$VMID" --ide2 "${ISO_STORAGE}:iso/${ISO_NAME},media=cdrom" --boot "order=ide2;scsi0" >/dev/null
+        manual_install_handoff
+        eject_and_reboot
+        return 0 ;;
+      *) msg_error "Stopped: the VM did not boot. Log: ${LOG_FILE}"; exit 1 ;;
+    esac
+  done
 }
 
 eject_and_reboot() {
@@ -462,6 +542,7 @@ eject_and_reboot() {
   qm shutdown "$VMID" --timeout 90 >/dev/null 2>&1 || qm stop "$VMID" >/dev/null
   qm start "$VMID"
   msg_ok "VM ${VMID} is booting from disk"
+  boot_installed_system
 }
 
 # Map one character to a qm sendkey key name (US keyboard layout).
@@ -569,7 +650,7 @@ wait_for_agent_after_reboot() {
 BOOTSTRAP_CMD="sudo apt-get update && sudo apt-get install -y qemu-guest-agent openssh-server && sudo reboot"
 
 type_bootstrap() {
-  countdown 120 "Waiting for the login screen"
+  countdown 45 "Waiting for the login screen"
   screenshot login-screen
 
   # Log in. If auto-login was ticked in the installer this just types into
@@ -622,6 +703,7 @@ Look at the VM console to see what happened. Screenshots are in ${LOG_DIR}." 16 
       retry)
         msg_info "Rebooting VM ${VMID} and trying again"
         qm reboot "$VMID" --timeout 120 >/dev/null 2>&1 || { qm stop "$VMID" >/dev/null; qm start "$VMID"; }
+        boot_installed_system
         type_bootstrap ;;
       manual)
         cat <<EOF
