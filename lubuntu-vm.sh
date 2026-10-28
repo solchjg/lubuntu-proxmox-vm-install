@@ -755,6 +755,8 @@ systemctl enable qemu-guest-agent || true   # static unit on Ubuntu; started by 
 EOF
 
   install_xrdp || msg_warn "xrdp install failed; see ${GUEST_LOG} in the VM. Continuing."
+  replace_firefox_snap || msg_warn "Firefox/snap replacement failed; see ${GUEST_LOG} in the VM. Continuing."
+  install_brave || msg_warn "Brave install failed; see ${GUEST_LOG} in the VM. Continuing."
 }
 
 # Find the newest xrdp-installer-X.Y.zip on c-nergy.be (fallback: 1.6).
@@ -793,6 +795,66 @@ chmod +x "\$SCRIPT"
 # shellcheck disable=SC2086
 sudo -u "\$VM_USER" -H env XDG_CURRENT_DESKTOP=LXQt bash "./\$SCRIPT" \$FLAGS </dev/null
 systemctl enable xrdp
+EOF
+}
+
+# Remove the Firefox snap and snapd, and install Firefox from Mozilla's own
+# APT repository instead (pinned so Ubuntu's snap-installing transitional
+# package and snapd never come back).
+replace_firefox_snap() {
+  guest_run "Replacing the Firefox snap with Mozilla's Firefox .deb and removing snap" <<EOF
+set -e
+exec > >(tee -a ${GUEST_LOG}) 2>&1
+# Keep the desktop metapackage installed when firefox/snapd change below.
+apt-mark manual lubuntu-desktop >/dev/null 2>&1 || true
+
+if command -v snap >/dev/null 2>&1; then
+  snap remove --purge firefox || true
+fi
+
+# Block Ubuntu's firefox transitional package (it installs the snap) and snapd.
+cat >/etc/apt/preferences.d/firefox-no-snap <<'PIN'
+Package: firefox*
+Pin: release o=Ubuntu
+Pin-Priority: -1
+PIN
+cat >/etc/apt/preferences.d/no-snapd <<'PIN'
+Package: snapd
+Pin: release a=*
+Pin-Priority: -10
+PIN
+
+# Mozilla's repository, preferred over everything else for its packages.
+install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://packages.mozilla.org/apt/repo-signing-key.gpg -o /etc/apt/keyrings/packages.mozilla.org.asc
+echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
+  >/etc/apt/sources.list.d/mozilla.list
+cat >/etc/apt/preferences.d/mozilla <<'PIN'
+Package: *
+Pin: origin packages.mozilla.org
+Pin-Priority: 1000
+PIN
+
+apt-get update
+# Ubuntu's transitional package has a higher version (epoch), hence downgrades.
+apt-get install -y --allow-downgrades firefox
+apt-get purge -y snapd
+rm -rf /snap /var/snap /var/lib/snapd /home/*/snap /root/snap
+apt-cache policy firefox | head -n 3
+EOF
+}
+
+# Brave and Brave Origin, with Brave's official install script.
+install_brave() {
+  guest_run "Installing Brave" <<EOF
+set -e
+exec > >(tee -a ${GUEST_LOG}) 2>&1
+curl -fsS https://dl.brave.com/install.sh | sh
+EOF
+  guest_run "Installing Brave Origin" <<EOF
+set -e
+exec > >(tee -a ${GUEST_LOG}) 2>&1
+curl -fsS https://dl.brave.com/install.sh | FLAVOR=origin sh
 EOF
 }
 
@@ -857,7 +919,7 @@ shutdown_and_snapshot() {
 
   msg_info "Taking snapshot '${SNAPSHOT_NAME}'"
   qm snapshot "$VMID" "$SNAPSHOT_NAME" \
-    --description "Fresh Lubuntu ${LUBUNTU_SERIES} install: nala, upgrades, OpenSSH, qemu-guest-agent, xrdp. Created $(date '+%F %T')." >/dev/null
+    --description "Fresh Lubuntu ${LUBUNTU_SERIES} install: nala, upgrades, OpenSSH, qemu-guest-agent, xrdp, Firefox (Mozilla deb), Brave, Brave Origin, no snap. Created $(date '+%F %T')." >/dev/null
   msg_ok "Snapshot '${SNAPSHOT_NAME}' created"
 }
 

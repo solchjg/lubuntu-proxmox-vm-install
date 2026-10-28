@@ -31,6 +31,9 @@ tmux attach -t lubuntu-vm
    - install nala, then `nala upgrade -y`
    - OpenSSH: upload the key to sadmin (and to root if root login is on), add `PermitRootLogin yes` in `/etc/ssh/sshd_config.d/10-permit-root-login.conf` if you chose it, and set the root password if you gave one
    - download the newest `xrdp-installer-X.Y.zip` from c-nergy.be (1.6 is the fallback) and run it as sadmin. sadmin gets passwordless sudo only for this step, and it is removed afterwards. If this step fails, the script warns you and carries on.
+   - remove the Firefox snap and snapd, and install Firefox from Mozilla's APT repository (`packages.mozilla.org`, pinned to priority 1000). APT pins block Ubuntu's snap-installing `firefox` package and snapd from coming back.
+   - install Brave (`curl -fsS https://dl.brave.com/install.sh | sh`) and Brave Origin (the same script with `FLAVOR=origin`)
+   - if the browser or snap steps fail, the script warns you and carries on
 7. **Finalize.** Disables cloud-init, switches networking to NetworkManager (as on a normal Lubuntu install), removes the cloud-init drive and the config snippet, reboots once and checks that the graphical login (SDDM) is running and SSH answers.
 8. **Snapshot.** Shuts the VM down and takes the snapshot `initial-install`.
 
