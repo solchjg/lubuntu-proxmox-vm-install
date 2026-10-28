@@ -5,34 +5,38 @@
 #
 # Run as root on the Proxmox host:   bash lubuntu-vm.sh
 #
+# Fully unattended: no installer to click through and no console typing.
+#
 # What it does, in order:
-#   1. Pre-flight checks (root, Proxmox VE 9, required tools).
-#   2. Makes sure the newest Lubuntu 26.04.x desktop ISO is in ISO storage
-#      (downloads + verifies it if missing, removes older 26.04 ISOs that no
-#      VM is using).
-#   3. Asks for VM settings with whiptail menus ("default" or "advanced",
-#      modelled on community-scripts' ubuntu-vm.sh) and the password for the
-#      'sadmin' user.
-#   4. Creates and starts the VM booted from the ISO. YOU click through the
-#      Lubuntu installer in the Proxmox console, creating user 'sadmin' with
-#      the password you gave the script.
-#   5. Ejects the ISO, reboots the VM, then types into the VM console
-#      (qm sendkey) to log in, open a terminal and install the QEMU guest
-#      agent + OpenSSH server.
-#   6. Through the guest agent (qm guest exec) it then: installs nala, runs
-#      nala upgrade, configures OpenSSH (optional public key, optional
-#      PermitRootLogin yes), and runs the newest c-nergy xrdp installer.
-#   7. Shuts the VM down and takes a snapshot named 'initial-install'.
+#   1. Restarts itself inside a tmux session (if not already in one), so it
+#      keeps running when you close the Proxmox shell. Reattach with
+#      'tmux attach -t lubuntu-vm'.
+#   2. Pre-flight checks (root, Proxmox VE 9, required tools).
+#   3. Downloads the official Ubuntu 26.04 server cloud image (or reuses the
+#      cached copy when its SHA256 still matches the newest release).
+#   4. Asks for VM settings with whiptail menus ("default" or "advanced",
+#      modelled on community-scripts' ubuntu-vm.sh), the 'sadmin' password,
+#      SSH options, an optional root password and xrdp options.
+#   5. Creates the VM from the cloud image. cloud-init creates 'sadmin' and
+#      installs qemu-guest-agent + openssh-server on first boot.
+#   6. Through the guest agent (qm guest exec) it installs lubuntu-desktop
+#      (the package set the Lubuntu ISO installs), nala, runs nala upgrade,
+#      configures OpenSSH (optional key, optional PermitRootLogin yes, root
+#      password) and runs the newest c-nergy xrdp installer.
+#   7. Disables cloud-init, removes its config, reboots once to check the
+#      desktop login comes up, shuts down and takes the snapshot
+#      'initial-install'.
 #
 # Assumptions / limits:
-#   * The VM console keyboard layout is US English (qm sendkey sends US
-#     scancodes, so other layouts would mistype the password).
-#   * The VM needs internet access through the chosen bridge.
+#   * The VM needs internet access through the chosen bridge (DHCP).
+#   * cloud-init reads its config from a "snippets" storage; if none exists
+#     the script offers to enable snippets on the 'local' storage. The
+#     snippet holds only a SHA-512 hash of the sadmin password, is mode 0600
+#     and is deleted once the VM is set up.
 #   * Everything that runs inside the guest is logged to
 #     /var/log/lubuntu-vm-setup.log in the guest.
 #   * Everything shown on screen is also logged on the host to
-#     /var/log/lubuntu-vm/lubuntu-vm-<date>.log (root-only, 0600), together
-#     with console screenshots taken during the auto-login step. Passwords
+#     /var/log/lubuntu-vm/lubuntu-vm-<date>.log (root-only, 0600). Passwords
 #     are never printed, so they never reach the log.
 # =============================================================================
 
@@ -42,12 +46,16 @@ set -Eeuo pipefail
 # Constants
 # -----------------------------------------------------------------------------
 LUBUNTU_SERIES="26.04"
-LUBUNTU_RELEASES_URL="https://cdimage.ubuntu.com/lubuntu/releases"
+UBUNTU_CODENAME="resolute"
+CLOUD_IMAGE_BASE="https://cloud-images.ubuntu.com/releases/server/${UBUNTU_CODENAME}/release"
+CLOUD_IMAGE_NAME="ubuntu-${LUBUNTU_SERIES}-server-cloudimg-amd64.img"
+IMAGE_CACHE_DIR="/var/lib/vz/template/cache"   # where the cloud image is cached
+TMUX_SESSION="lubuntu-vm"
+SCRIPT_URL="https://raw.githubusercontent.com/solchjg/lubuntu-proxmox-vm-install/main/lubuntu-vm.sh"
 XRDP_PRODUCTS_URL="https://www.c-nergy.be/products.html"
 XRDP_FALLBACK_URL="https://c-nergy.be/downloads/xRDP/xrdp-installer-1.6.zip"
 VM_USER="sadmin"
 SNAPSHOT_NAME="initial-install"
-ISO_STORAGE="local"                       # Proxmox storage that holds ISOs
 GUEST_LOG="/var/log/lubuntu-vm-setup.log" # log file inside the guest
 LOG_DIR="/var/log/lubuntu-vm"              # host log directory (root only)
 LOG_FILE="${LOG_DIR}/lubuntu-vm-$(date +%Y%m%d-%H%M%S).log"
@@ -73,10 +81,12 @@ MAC="02:$(openssl rand -hex 5 | tr '[:lower:]' '[:upper:]' | sed 's/\(..\)/\1:/g
 VLAN=""
 MTU=""
 KEYBOARD=""
-DISPLAY_TYPE="virtio"     # VirtIO-GPU; std VGA left the Lubuntu 26.04 installer with no display
+DISPLAY_TYPE="virtio"     # VirtIO-GPU (std VGA showed no console in testing)
 VERBOSE="no"
 START_VM="yes"
 VM_CREATED="no"           # set once qm create succeeds; lets abort clean up
+SNIPPET_STORAGE=""        # storage holding the cloud-init user-data snippet
+SNIPPET_PATH=""
 
 # Post-install choices
 VM_PASSWORD=""
@@ -107,7 +117,7 @@ start_logging() {
   chmod 600 "$LOG_FILE"
   exec > >(tee >(sed -u -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\x1b[()][A-Z0-9]//g' >>"$LOG_FILE")) 2>&1
   echo "=== lubuntu-vm.sh started $(date '+%F %T') on $(hostname) ==="
-  umask 022   # back to normal for the ISO and anything else the script writes
+  umask 022   # back to normal for the image and anything else the script writes
 }
 trap cleanup EXIT
 trap 'msg_error "Failed at line $LINENO: $BASH_COMMAND"' ERR
@@ -137,6 +147,44 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
+# 0. Keep running when the shell closes
+# -----------------------------------------------------------------------------
+# Closing the Proxmox web shell kills whatever runs in it. Unless we are
+# already inside tmux, start a tmux session that runs this script and attach
+# to it. If the shell closes, the session keeps going:
+#   tmux attach -t lubuntu-vm
+ensure_tmux() {
+  local ans cmd
+  [[ -n "${TMUX:-}" || "${LUBUNTU_VM_NO_TMUX:-0}" == "1" ]] && return 0
+  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    echo " A '${TMUX_SESSION}' session is already running; attaching to it."
+    exec tmux attach -t "$TMUX_SESSION"
+  fi
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo " tmux keeps this script running if the Proxmox shell is closed."
+    read -r -p " Install tmux now (apt-get install tmux)? [Y/n]: " ans
+    if [[ "${ans,,}" == n* ]]; then
+      echo " Continuing without tmux: keep this shell open until the script ends."
+      return 0
+    fi
+    apt-get install -y tmux >/dev/null || { echo " Could not install tmux; continuing without it."; return 0; }
+  fi
+  # Run from this file if we have one, otherwise fetch the script again
+  # (it was started with: bash -c "$(curl ...)").
+  if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+    cmd="bash $(printf '%q' "$(readlink -f "${BASH_SOURCE[0]}")")"
+  else
+    cmd="bash -c \"\$(curl -fsSL ${SCRIPT_URL})\""
+  fi
+  tmux new-session -d -s "$TMUX_SESSION" \
+    "${cmd}; echo; read -r -p ' Script finished. Press Enter to close this tmux session. ' _"
+  echo " Started tmux session '${TMUX_SESSION}'. If this shell closes, reattach with:"
+  echo "   tmux attach -t ${TMUX_SESSION}"
+  sleep 2
+  exec tmux attach -t "$TMUX_SESSION"
+}
+
+# -----------------------------------------------------------------------------
 # 1. Pre-flight checks
 # -----------------------------------------------------------------------------
 preflight() {
@@ -156,74 +204,60 @@ preflight() {
       "This script was written for Proxmox VE 9.\nContinue anyway?" 9 50 || exit_script
   fi
   local tool
-  for tool in curl whiptail sha256sum perl qm pvesm pvesh blkid partx; do
+  for tool in curl whiptail sha256sum perl qm pvesm pvesh openssl; do
     command -v "$tool" >/dev/null 2>&1 || { msg_error "Missing required tool: $tool"; exit 1; }
   done
 }
 
 # -----------------------------------------------------------------------------
-# 2. ISO management
+# 2. Cloud image
 # -----------------------------------------------------------------------------
-# Finds the newest 26.04 point release on cdimage.ubuntu.com, e.g. 26.04.1,
-# and sets ISO_NAME, ISO_URL, ISO_SHA256.
-find_latest_iso() {
-  msg_info "Looking up the newest Lubuntu ${LUBUNTU_SERIES} release"
-  local release
-  release="$(curl -fsSL "${LUBUNTU_RELEASES_URL}/" \
-    | grep -oE "href=\"${LUBUNTU_SERIES//./\\.}(\.[0-9]+)?/\"" \
-    | sed 's/href="//; s#/"##' | sort -V | tail -n1)"
-  if [[ -z "$release" ]]; then
-    msg_error "Could not find a Lubuntu ${LUBUNTU_SERIES} release on ${LUBUNTU_RELEASES_URL}"
+# Download the newest Ubuntu 26.04 cloud image into the cache, or reuse the
+# cached copy if it still matches the published SHA256. Sets IMAGE_PATH.
+ensure_image() {
+  local sha
+  msg_info "Checking the newest Ubuntu ${LUBUNTU_SERIES} cloud image"
+  sha="$(curl -fsSL "${CLOUD_IMAGE_BASE}/SHA256SUMS" | awk -v f="*${CLOUD_IMAGE_NAME}" '$2==f {print $1}')"
+  if [[ -z "$sha" ]]; then
+    msg_error "No checksum published for ${CLOUD_IMAGE_NAME} at ${CLOUD_IMAGE_BASE}"
     exit 1
   fi
-  local base="${LUBUNTU_RELEASES_URL}/${release}/release"
-  ISO_NAME="lubuntu-${release}-desktop-amd64.iso"
-  ISO_URL="${base}/${ISO_NAME}"
-  ISO_SHA256="$(curl -fsSL "${base}/SHA256SUMS" | awk -v f="*${ISO_NAME}" '$2==f {print $1}')"
-  if [[ -z "$ISO_SHA256" ]]; then
-    msg_error "No SHA256 checksum published for ${ISO_NAME}"
+  mkdir -p "$IMAGE_CACHE_DIR"
+  IMAGE_PATH="${IMAGE_CACHE_DIR}/${CLOUD_IMAGE_NAME}"
+  if [[ -f "$IMAGE_PATH" ]] && echo "${sha}  ${IMAGE_PATH}" | sha256sum -c --status; then
+    msg_ok "Cached cloud image is the newest release: ${IMAGE_PATH}"
+    return 0
+  fi
+  [[ -f "$IMAGE_PATH" ]] && msg_info "Cached image is outdated; downloading the new release"
+  msg_info "Downloading ${CLOUD_IMAGE_BASE}/${CLOUD_IMAGE_NAME}"
+  curl -fL --progress-bar -o "${IMAGE_PATH}.part" "${CLOUD_IMAGE_BASE}/${CLOUD_IMAGE_NAME}" 2>/dev/tty
+  if ! echo "${sha}  ${IMAGE_PATH}.part" | sha256sum -c --status; then
+    rm -f "${IMAGE_PATH}.part"
+    msg_error "Checksum mismatch for ${CLOUD_IMAGE_NAME}; download removed."
     exit 1
   fi
-  msg_ok "Newest release is ${BL}${ISO_NAME}${CL}"
+  mv -f "${IMAGE_PATH}.part" "$IMAGE_PATH"   # replaces the older image
+  msg_ok "Downloaded and verified ${CLOUD_IMAGE_NAME}"
 }
 
-# True if any VM config references the given ISO file name.
-iso_in_use() {
-  grep -qs -- "$1" /etc/pve/qemu-server/*.conf /etc/pve/nodes/*/qemu-server/*.conf
-}
-
-ensure_iso() {
-  find_latest_iso
-  local iso_dir
-  iso_dir="$(dirname "$(pvesm path "${ISO_STORAGE}:iso/${ISO_NAME}")")"
-  ISO_PATH="${iso_dir}/${ISO_NAME}"
-
-  if [[ -f "$ISO_PATH" ]] && echo "${ISO_SHA256}  ${ISO_PATH}" | sha256sum -c --status; then
-    msg_ok "ISO already present and verified: ${ISO_PATH}"
-  else
-    msg_info "Downloading ${ISO_URL}"
-    curl -fL --progress-bar -o "${ISO_PATH}.part" "$ISO_URL" 2>/dev/tty
-    msg_info "Verifying SHA256 checksum"
-    if ! echo "${ISO_SHA256}  ${ISO_PATH}.part" | sha256sum -c --status; then
-      rm -f "${ISO_PATH}.part"
-      msg_error "Checksum mismatch for ${ISO_NAME}; download removed."
+# Find a storage that can hold cloud-init snippets. If there is none, offer
+# to add 'snippets' to the content types of the 'local' storage.
+ensure_snippet_storage() {
+  local ans content
+  SNIPPET_STORAGE="$(pvesm status -content snippets 2>/dev/null | awk 'NR>1 && $3=="active" {print $1; exit}')"
+  if [[ -z "$SNIPPET_STORAGE" ]]; then
+    echo
+    echo " cloud-init needs a storage with the 'snippets' content type, and none has it."
+    read -r -p " Enable snippets on the 'local' storage? [Y/n]: " ans
+    if [[ "${ans,,}" == n* ]]; then
+      msg_error "Cannot continue without snippets storage."
       exit 1
     fi
-    mv -f "${ISO_PATH}.part" "$ISO_PATH"
-    msg_ok "Downloaded and verified ${ISO_NAME}"
+    content="$(pvesh get /storage/local --output-format json | perl -MJSON -0777 -ne 'print decode_json($_)->{content}')"
+    pvesm set local --content "${content},snippets"
+    SNIPPET_STORAGE="local"
+    msg_ok "Enabled snippets on 'local'"
   fi
-
-  # Remove older Lubuntu 26.04 ISOs, but never one that a VM still uses.
-  local old
-  for old in "${iso_dir}"/lubuntu-"${LUBUNTU_SERIES}"*-desktop-amd64.iso; do
-    [[ -e "$old" && "$old" != "$ISO_PATH" ]] || continue
-    if iso_in_use "$(basename "$old")"; then
-      msg_warn "Keeping $(basename "$old"): it is still attached to a VM."
-    else
-      rm -f "$old"
-      msg_ok "Removed older ISO $(basename "$old")"
-    fi
-  done
 }
 
 # -----------------------------------------------------------------------------
@@ -318,11 +352,11 @@ advanced_settings() {
   MTU="${v:+,mtu=$v}"
 
   DISPLAY_TYPE="$(wt --title "DISPLAY" --radiolist \
-    "Graphic card. Standard VGA left the Lubuntu 26.04 installer with no display." 12 70 3 \
+    "Graphic card for the VM console." 12 70 3 \
     "virtio" "VirtIO-GPU (default)" ON "std" "Standard VGA" OFF "qxl" "SPICE (qxl)" OFF)" || exit_script
 
   KEYBOARD="$(wt --title "KEYBOARD" --inputbox \
-    "Console keyboard layout (blank = Proxmox default).\nNote: the auto-login step types with a US layout." 10 58 "")" || exit_script
+    "Console keyboard layout (blank = Proxmox default)." 9 58 "")" || exit_script
 
   if wt --title "VERBOSE MODE" --defaultno --yesno "Show command output (verbose mode)?" 8 58; then VERBOSE="yes"; fi
   if ! wt --title "START VIRTUAL MACHINE" --yesno "Start VM and continue with the install when done?" 8 58; then START_VM="no"; fi
@@ -344,8 +378,6 @@ ask_password() {
       wt --title "ERROR" --msgbox "Password cannot be empty." 8 40
     elif [[ "$p1" != "$p2" ]]; then
       wt --title "ERROR" --msgbox "Passwords do not match." 8 40
-    elif ! typeable "$p1"; then
-      wt --title "ERROR" --msgbox "Use only letters, digits, spaces and US-keyboard symbols:\nthe script types this password into the VM console." 9 64
     elif [[ -n "$forbidden" && "$p1" == "$forbidden" ]]; then
       wt --title "ERROR" --msgbox "The root password must be different from ${VM_USER}'s password." 8 64
     else
@@ -355,8 +387,7 @@ ask_password() {
 }
 
 post_install_settings() {
-  ask_password "PASSWORD FOR ${VM_USER}" \
-    "Password for user '${VM_USER}'.\nUse the same password when the Lubuntu installer asks."
+  ask_password "PASSWORD FOR ${VM_USER}" "Password for user '${VM_USER}'."
   VM_PASSWORD="$PASSWORD_RESULT"
 
   # Optional public key: a file path on this host, or the key pasted in.
@@ -417,113 +448,70 @@ create_vm() {
   [[ "$DISK_CACHE" != "none" ]] && cache_opt=",cache=${DISK_CACHE}"
   [[ -n "$KEYBOARD" ]] && kb_opt="--keyboard ${KEYBOARD}"
 
+  # The system disk is imported from the cloud image, then grown to size.
   # shellcheck disable=SC2086  # optional flags are intentionally word-split
   qm create "$VMID" --name "$HN" --ostype l26 $machine_opt --bios "$BIOS" \
     --cpu "$CPU_TYPE" --cores "$CORE_COUNT" --memory "$RAM_SIZE" \
     --net0 "virtio,bridge=${BRG},macaddr=${MAC}${VLAN}${MTU}" \
     --scsihw virtio-scsi-single \
-    --scsi0 "${STORAGE}:${DISK_SIZE},discard=on,ssd=1,iothread=1${cache_opt}" \
-    --ide2 "${ISO_STORAGE}:iso/${ISO_NAME},media=cdrom" \
-    --boot "order=ide2;scsi0" \
-    --agent enabled=1 --vga "$DISPLAY_TYPE" --tablet 1 --onboot 0 \
+    --scsi0 "${STORAGE}:0,import-from=${IMAGE_PATH},discard=on,ssd=1,iothread=1${cache_opt}" \
+    --boot order=scsi0 \
+    --agent enabled=1 --vga "$DISPLAY_TYPE" --serial0 socket --tablet 1 --onboot 0 \
     --tags lubuntu --description "Lubuntu ${LUBUNTU_SERIES} desktop, created by lubuntu-vm.sh" \
     $kb_opt >/dev/null
+  VM_CREATED="yes"
 
   if [[ "$BIOS" == "ovmf" ]]; then
     qm set "$VMID" --efidisk0 "${STORAGE}:1,efitype=4m,pre-enrolled-keys=1" >/dev/null
   fi
-  VM_CREATED="yes"
-  msg_ok "Created VM ${BL}${VMID}${CL} (${HN})"
+  qm disk resize "$VMID" scsi0 "${DISK_SIZE}G" >/dev/null
+  msg_ok "Created VM ${BL}${VMID}${CL} (${HN}) with a ${DISK_SIZE} GiB disk from the cloud image"
+
+  write_cloud_init
 }
 
-# -----------------------------------------------------------------------------
-# 5. Manual install handoff and console bootstrap
-# -----------------------------------------------------------------------------
-manual_install_handoff() {
-  qm start "$VMID"
-  msg_ok "Started VM ${VMID} from the installer ISO"
-  local node; node="$(hostname)"
-  cat <<EOF
-
- ${BOLD}Now install Lubuntu in the VM console:${CL}
-   Proxmox web UI  ->  ${node}  ->  VM ${VMID} (${HN})  ->  Console
-
-   * Choose "Install Lubuntu" and click through the installer.
-   * Your name / username:  ${BOLD}${VM_USER}${CL}
-   * Computer name:         ${BOLD}${HN}${CL}
-   * Password:              the password you just entered in this script
-   * Keyboard layout:       English (US)
-   * When it says the installation is complete, ${BOLD}do NOT click Restart${CL}.
-     Come back here and press Enter.
-
- A status line is printed every 30 seconds while you install.
- Press Enter at any time to continue or to abort.
-
+# cloud-init first-boot config: create sadmin (password stored as a SHA-512
+# hash only), allow SSH password login, install the guest agent + SSH server.
+# Everything else is done later through the guest agent.
+write_cloud_init() {
+  local hash snippet_dir
+  msg_info "Writing the cloud-init configuration"
+  hash="$(printf '%s' "$VM_PASSWORD" | openssl passwd -6 -stdin)"
+  snippet_dir="$(dirname "$(pvesm path "${SNIPPET_STORAGE}:snippets/x.yaml")")"
+  mkdir -p "$snippet_dir"
+  SNIPPET_PATH="${snippet_dir}/lubuntu-vm-${VMID}-user.yaml"
+  (
+    umask 077
+    cat >"$SNIPPET_PATH" <<EOF
+#cloud-config
+hostname: ${HN}
+users:
+  - name: ${VM_USER}
+    gecos: ${VM_USER}
+    groups: [adm, sudo, plugdev, audio, video]
+    shell: /bin/bash
+    lock_passwd: false
+    passwd: '${hash}'
+ssh_pwauth: true
+package_update: true
+packages:
+  - qemu-guest-agent
+  - openssh-server
+runcmd:
+  - [systemctl, enable, --now, qemu-guest-agent]
 EOF
-  wait_for_install
+  )
+  qm set "$VMID" --ide2 "${STORAGE}:cloudinit" \
+    --cicustom "user=${SNIPPET_STORAGE}:snippets/$(basename "$SNIPPET_PATH")" \
+    --ipconfig0 ip=dhcp >/dev/null
+  msg_ok "cloud-init will create ${VM_USER} and install the guest agent on first boot"
 }
 
-# One status line: elapsed time, VM state, data written to the disk so far,
-# and whether the disk has partitions yet.
-install_status() {
-  local start="$1" elapsed json state written parts rc
-  elapsed=$(( $(date +%s) - start ))
-  json="$(pvesh get "/nodes/$(hostname)/qemu/${VMID}/status/current" --output-format json 2>/dev/null || echo '{}')"
-  # qmpstatus is QEMU's own view (running / paused / prelaunch / ...).
-  state="$(perl -MJSON -0777 -ne 'my $j = decode_json($_); print $j->{qmpstatus} // $j->{status} // "unknown"' <<<"$json")"
-  written="$(perl -MJSON -0777 -ne 'my $j = decode_json($_); my $b = $j->{blockstat}{scsi0}{wr_bytes} // 0;
-    printf "%.1f GiB", $b / 1073741824' <<<"$json")"
-  rc=0; disk_has_os || rc=$?
-  case "$rc" in 0) parts="yes" ;; 1) parts="none yet" ;; *) parts="unknown" ;; esac
-  printf ' [%02d:%02d] VM %s | written to disk: %s | partitions: %s\n' \
-    $((elapsed / 60)) $((elapsed % 60)) "$state" "$written" "$parts"
-  # A console screenshot every 2 minutes, so a stuck installer can be seen
-  # in the log folder afterwards.
-  if ((elapsed >= 30 && elapsed / 120 != ${LAST_INSTALL_SHOT:--1})); then
-    LAST_INSTALL_SHOT=$((elapsed / 120))
-    screenshot install
-  fi
-}
-
-# Wait for the manual install with a status line every 30 seconds. Enter
-# opens a plain prompt: continue, keep waiting, or abort and clean up.
-wait_for_install() {
-  local start ans rc
-  LAST_INSTALL_SHOT=-1
-  start=$(date +%s)
-  install_status "$start"
-  while true; do
-    rc=0; read -r -t 30 _ || rc=$?
-    if ((rc > 128)); then         # timed out: just report status
-      install_status "$start"; continue
-    elif ((rc != 0)); then        # stdin closed: avoid a busy loop
-      sleep 30; install_status "$start"; continue
-    fi
-    echo
-    echo " Has the installer shown \"Installation complete\"?"
-    echo "   y = yes, continue (eject the ISO and reboot into Lubuntu)"
-    echo "   w = not yet, keep waiting"
-    echo "   n = no, ABORT: stop and delete VM ${VMID} and its disks"
-    read -r -p " Choice [y/w/n]: " ans
-    case "${ans,,}" in
-      y|yes)
-        # Don't take the answer on trust: an empty disk means the installer
-        # has not run, and rebooting would land in the UEFI boot menu.
-        rc=0; disk_has_os || rc=$?
-        case "$rc" in
-          0) msg_ok "The VM disk has partitions: the install wrote to it"; return 0 ;;
-          2) msg_warn "Cannot inspect the disk on this storage type; continuing on your word."; return 0 ;;
-          *) msg_warn "The VM disk is still empty, so the install has not run. Still waiting." ;;
-        esac ;;
-      n|no) abort_install "Install aborted at your request." ;;
-      *) echo " Still waiting." ;;
-    esac
-    install_status "$start"
-  done
-}
-
+# -----------------------------------------------------------------------------
+# 5. First boot: wait for cloud-init and the guest agent
+# -----------------------------------------------------------------------------
 # Abort: optionally stop and destroy the VM this script created (with its
-# disks), then exit. The ISO and the log are kept.
+# disks), then exit. The cached image and the log are kept.
 abort_install() {
   local reason="$1" ans
   echo
@@ -543,138 +531,15 @@ abort_install() {
       msg_ok "VM ${VMID} was left as it is."
     fi
   fi
-  echo "   The ISO stays in storage. Log: ${LOG_FILE}"
+  [[ -n "$SNIPPET_PATH" ]] && rm -f "$SNIPPET_PATH"
+  echo "   The cached cloud image stays in ${IMAGE_CACHE_DIR}. Log: ${LOG_FILE}"
   exit 1
-}
-
-# Check the VM's system disk from the host (read-only).
-#   0 = has a partition table with at least 2 partitions (Lubuntu: ESP + root)
-#   1 = empty / no partitions
-#   2 = cannot tell (not a block device, e.g. qcow2 on directory storage)
-disk_has_os() {
-  local volid dev parts
-  volid="$(qm config "$VMID" | sed -n 's/^scsi0: \([^,]*\).*/\1/p')"
-  dev="$(pvesm path "$volid" 2>/dev/null)" || return 2
-  [[ -b "$dev" ]] || return 2
-  blkid -p -s PTTYPE -o value "$dev" >/dev/null 2>&1 || return 1
-  parts="$(partx -g -o NR "$dev" 2>/dev/null | wc -l)"
-  ((parts >= 2)) || return 1
-  return 0
-}
-
-# Wait until the installed OS is up, judged by network traffic from the VM:
-# the UEFI firmware sends nothing (the NIC is not in the boot order), while
-# Ubuntu asks for a DHCP lease as soon as it boots. The tap device is created
-# fresh on every VM start, so its counter starts at 0.
-wait_for_os_boot() {
-  local timeout="$1" start now rx stats="/sys/class/net/tap${VMID}i0/statistics/rx_packets"
-  start=$(date +%s)
-  msg_info "Waiting for the installed system to boot (up to $((timeout / 60)) minutes)"
-  while true; do
-    now=$(date +%s)
-    rx=$(cat "$stats" 2>/dev/null || echo 0)
-    printf '\r   packets from the VM: %4s, %4ss elapsed ' "$rx" "$((now - start))" >/dev/tty
-    if ((rx >= 10)); then
-      echo >/dev/tty
-      msg_ok "The installed system is up (its network is active)"
-      return 0
-    fi
-    if ((now - start >= timeout)); then
-      echo >/dev/tty
-      return 1
-    fi
-    sleep 5
-  done
-}
-
-# Boot from disk and make sure it worked. If it did not, offer to go back to
-# the installer instead of typing keystrokes into the firmware menu.
-boot_installed_system() {
-  local choice
-  while true; do
-    wait_for_os_boot 300 && return 0
-    screenshot boot-failed
-    msg_error "The VM did not boot from its disk."
-    choice="$(wt --title "VM DID NOT BOOT" --menu \
-"No sign of the installed system after 5 minutes. The console probably shows
-'No bootable option or device was found', meaning the install did not finish.
-Screenshot saved in ${LOG_DIR}." 15 78 3 \
-      "reinstall" "Re-attach the ISO and run the installer again" \
-      "wait"      "Keep waiting another 5 minutes" \
-      "abort"     "Stop the script (the VM is left as it is)")" || choice="abort"
-    case "$choice" in
-      wait) ;;
-      reinstall)
-        qm stop "$VMID" >/dev/null 2>&1 || true
-        qm set "$VMID" --ide2 "${ISO_STORAGE}:iso/${ISO_NAME},media=cdrom" --boot "order=ide2;scsi0" >/dev/null
-        manual_install_handoff
-        eject_and_reboot
-        return 0 ;;
-      *) abort_install "Stopped: the VM did not boot." ;;
-    esac
-  done
-}
-
-eject_and_reboot() {
-  msg_info "Removing the installer ISO and switching boot to the disk"
-  qm set "$VMID" --ide2 none,media=cdrom --boot order=scsi0 >/dev/null
-  msg_ok "ISO removed"
-
-  msg_info "Rebooting VM ${VMID} into the installed system"
-  # A clean ACPI shutdown of the live session; force it off if it ignores us.
-  qm shutdown "$VMID" --timeout 90 >/dev/null 2>&1 || qm stop "$VMID" >/dev/null
-  qm start "$VMID"
-  msg_ok "VM ${VMID} is booting from disk"
-  boot_installed_system
-}
-
-# Map one character to a qm sendkey key name (US keyboard layout).
-key_for_char() {
-  local c="$1"
-  case "$c" in
-    [a-z0-9]) echo "$c" ;;
-    [A-Z])    echo "shift-${c,,}" ;;
-    ' ')  echo "spc" ;;
-    '-')  echo "minus" ;;        '_')  echo "shift-minus" ;;
-    '=')  echo "equal" ;;        '+')  echo "shift-equal" ;;
-    '[')  echo "bracket_left" ;; '{')  echo "shift-bracket_left" ;;
-    ']')  echo "bracket_right" ;; '}') echo "shift-bracket_right" ;;
-    ';')  echo "semicolon" ;;    ':')  echo "shift-semicolon" ;;
-    "'")  echo "apostrophe" ;;   '"')  echo "shift-apostrophe" ;;
-    '`')  echo "grave_accent" ;; '~')  echo "shift-grave_accent" ;;
-    '\')  echo "backslash" ;;    '|')  echo "shift-backslash" ;;
-    ',')  echo "comma" ;;        '<')  echo "shift-comma" ;;
-    '.')  echo "dot" ;;          '>')  echo "shift-dot" ;;
-    '/')  echo "slash" ;;        '?')  echo "shift-slash" ;;
-    '!')  echo "shift-1" ;; '@') echo "shift-2" ;; '#') echo "shift-3" ;;
-    '$')  echo "shift-4" ;; '%') echo "shift-5" ;; '^') echo "shift-6" ;;
-    '&')  echo "shift-7" ;; '*') echo "shift-8" ;; '(') echo "shift-9" ;;
-    ')')  echo "shift-0" ;;
-    *) return 1 ;;
-  esac
-}
-
-# Type a string into the VM console, one key at a time.
-type_text() {
-  local text="$1" i key
-  for ((i = 0; i < ${#text}; i++)); do
-    key="$(key_for_char "${text:i:1}")" || { msg_error "Text contains a character sendkey cannot type"; return 1; }
-    qm sendkey "$VMID" "$key"
-  done
-}
-
-# True if every character of $1 can be typed with qm sendkey.
-typeable() {
-  local text="$1" i
-  for ((i = 0; i < ${#text}; i++)); do
-    key_for_char "${text:i:1}" >/dev/null || return 1
-  done
 }
 
 guest_agent_up() { qm guest cmd "$VMID" ping >/dev/null 2>&1; }
 
 # Save a PNG screenshot of the VM console into the log directory, so a
-# failed auto-login can be diagnosed afterwards. Never fatal.
+# problem can be diagnosed afterwards. Never fatal.
 SHOT_NO=0
 screenshot() {
   SHOT_NO=$((SHOT_NO + 1))
@@ -688,120 +553,51 @@ screenshot() {
   return 0
 }
 
-# Sleep up to $1 seconds showing a countdown; Enter skips the rest.
-countdown() {
-  local secs="$1" msg="$2"
-  while ((secs > 0)); do
-    printf '\r   %s: %3ss left (Enter to skip) ' "$msg" "$secs" >/dev/tty
-    if read -r -t 1 _ </dev/tty; then break; fi
-    secs=$((secs - 1))
-  done
-  printf '\r%*s\r' 70 '' >/dev/tty
-}
-
-# Seconds since the guest booted, as reported through the guest agent.
-guest_uptime() {
-  qm guest exec "$VMID" --timeout 15 -- cat /proc/uptime 2>/dev/null \
-    | perl -MJSON -0777 -ne 'my $j = decode_json($_); my ($u) = split / /, ($j->{"out-data"} // ""); print int($u || 0)'
-}
-
-# Wait up to $1 seconds for the guest agent to answer *after* the reboot
-# that ends the bootstrap command typed at epoch second $2. Shows progress.
-wait_for_agent_after_reboot() {
-  local timeout="$1" typed_at="$2" start now up
+# Wait up to $1 seconds for the guest agent, printing a status line every
+# 30 seconds (elapsed time and packets received from the VM).
+wait_for_agent() {
+  local timeout="$1" start now rx last=-30
   start=$(date +%s)
   while true; do
     now=$(date +%s)
-    ((now - start < timeout)) || { echo >/dev/tty; return 1; }
-    printf '\r   waiting for the guest agent: %4ss elapsed ' "$((now - start))" >/dev/tty
     if guest_agent_up; then
-      up="$(guest_uptime || true)"
-      # Booted after the command was typed: the install and reboot are done.
-      if [[ -n "$up" && "$up" -gt 0 && "$up" -lt $((now - typed_at)) ]]; then
-        echo >/dev/tty
-        return 0
-      fi
-    fi
-    sleep 10
-  done
-}
-
-# Log in at the console, open a terminal and type a command that installs
-# the guest agent + SSH server and then reboots the VM. The script does not
-# wait for the agent inside that session: it checks for it after the reboot,
-# when the agent starts normally at boot.
-BOOTSTRAP_CMD="sudo apt-get update && sudo apt-get install -y qemu-guest-agent openssh-server && sudo reboot"
-
-type_bootstrap() {
-  countdown 45 "Waiting for the login screen"
-  screenshot login-screen
-
-  # Log in. If auto-login was ticked in the installer this just types into
-  # the empty desktop, which is harmless.
-  msg_info "Logging in as ${VM_USER} at the console"
-  qm sendkey "$VMID" ctrl            # wake the screen / focus the password box
-  sleep 2
-  type_text "$VM_PASSWORD"
-  qm sendkey "$VMID" ret
-  countdown 60 "Waiting for the desktop"
-  screenshot desktop
-
-  msg_info "Opening a terminal (Ctrl+Alt+T)"
-  qm sendkey "$VMID" ctrl-alt-t
-  sleep 10
-  screenshot terminal
-
-  msg_info "Typing: ${BOOTSTRAP_CMD}"
-  TYPED_AT=$(date +%s)
-  type_text "$BOOTSTRAP_CMD"
-  qm sendkey "$VMID" ret
-  sleep 5
-  type_text "$VM_PASSWORD"           # answers the sudo prompt
-  qm sendkey "$VMID" ret
-  sleep 15
-  screenshot after-sudo
-  msg_ok "Command sent. The VM will install the packages and reboot by itself."
-}
-
-console_bootstrap() {
-  local choice
-  type_bootstrap
-  while true; do
-    msg_info "Checking for the guest agent after the VM reboots (up to 15 minutes)"
-    if wait_for_agent_after_reboot 900 "$TYPED_AT"; then
-      msg_ok "Guest agent is running after the reboot"
+      msg_ok "Guest agent is answering after $((now - start))s"
       return 0
     fi
-    msg_warn "The guest agent has not answered yet."
-    screenshot no-agent
-    choice="$(wt --title "GUEST AGENT NOT FOUND" --menu \
-"The guest agent did not answer within 15 minutes.
-Look at the VM console to see what happened. Screenshots are in ${LOG_DIR}." 16 76 4 \
-      "wait"   "Keep waiting another 15 minutes" \
-      "retry"  "Reboot the VM and type the command again" \
-      "manual" "I will run the command in the console myself" \
-      "abort"  "Stop the script (the VM is left as it is)")" || choice="abort"
-    case "$choice" in
-      wait) ;;
-      retry)
-        msg_info "Rebooting VM ${VMID} and trying again"
-        qm reboot "$VMID" --timeout 120 >/dev/null 2>&1 || { qm stop "$VMID" >/dev/null; qm start "$VMID"; }
-        boot_installed_system
-        type_bootstrap ;;
-      manual)
-        cat <<EOF
-
- In the VM console, log in as ${VM_USER}, open a terminal (Ctrl+Alt+T) and run:
-
-   ${BOLD}${BOOTSTRAP_CMD}${CL}
-
-EOF
-        TYPED_AT=$(date +%s)
-        msg_info "Waiting for you to run it; the VM reboots when it finishes" ;;
-      *)
-        abort_install "Stopped at the guest agent step." ;;
-    esac
+    if ((now - start >= timeout)); then return 1; fi
+    if ((now - start - last >= 30)); then
+      last=$((now - start))
+      rx=$(cat "/sys/class/net/tap${VMID}i0/statistics/rx_packets" 2>/dev/null || echo 0)
+      printf ' [%02d:%02d] VM %s | packets from VM: %s | waiting for cloud-init + guest agent\n' \
+        $((last / 60)) $((last % 60)) "$(qm status "$VMID" | awk '{print $2}')" "$rx"
+    fi
+    sleep 5
   done
+}
+
+first_boot() {
+  local ans
+  qm start "$VMID"
+  msg_ok "Started VM ${VMID}"
+  msg_info "First boot: cloud-init creates ${VM_USER} and installs the guest agent (usually 2-5 minutes)"
+  while ! wait_for_agent 900; do
+    screenshot no-agent
+    msg_warn "The guest agent has not answered after 15 minutes."
+    echo "   Check the VM console (or the screenshot above) for errors, e.g. no network."
+    read -r -p " Keep waiting another 15 minutes? [Y/n]: " ans
+    [[ "${ans,,}" == n* ]] && abort_install "Stopped waiting for the guest agent."
+  done
+  # cloud-init may still be finishing package installs; let it complete.
+  guest_run "Waiting for cloud-init to finish" <<'EOF'
+cloud-init status --wait >/dev/null || true
+EOF
+}
+
+# Reboot and wait for the agent again (used to confirm the desktop boots).
+reboot_and_wait() {
+  msg_info "Rebooting VM ${VMID}"
+  qm reboot "$VMID" --timeout 180 >/dev/null 2>&1 || { qm stop "$VMID" >/dev/null; qm start "$VMID"; }
+  wait_for_agent 600 || abort_install "The VM did not come back after the reboot."
 }
 
 # -----------------------------------------------------------------------------
@@ -813,7 +609,7 @@ EOF
 guest_run() {
   local desc="$1" json code out
   msg_info "$desc"
-  json="$(qm guest exec "$VMID" --timeout 3600 --pass-stdin 1 -- \
+  json="$(qm guest exec "$VMID" --timeout 7200 --pass-stdin 1 -- \
     /usr/bin/env DEBIAN_FRONTEND=noninteractive TERM=dumb \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     bash -s)" || true
@@ -829,6 +625,18 @@ guest_run() {
 }
 
 post_install() {
+  guest_run "Installing the Lubuntu desktop (lubuntu-desktop, about 1-2 GB of downloads)" <<EOF
+set -e
+exec > >(tee -a ${GUEST_LOG}) 2>&1
+apt-get update
+apt-get install -y lubuntu-desktop linux-generic
+systemctl set-default graphical.target
+# Groups the Lubuntu installer gives the first user (they exist only now).
+for g in lpadmin sambashare dip; do
+  if getent group "\$g" >/dev/null; then usermod -aG "\$g" ${VM_USER}; fi
+done
+EOF
+
   guest_run "Installing nala" <<EOF
 set -e
 exec > >(tee -a ${GUEST_LOG}) 2>&1
@@ -939,6 +747,36 @@ check_ssh() {
   fi
 }
 
+# Stop cloud-init from running again (it would reset hostname/users on
+# clones), switch networking to NetworkManager, remove the cloud-init drive
+# and the snippet with the password hash, then reboot once and check that the
+# graphical login (SDDM) starts.
+finalize() {
+  guest_run "Disabling cloud-init for future boots" <<EOF
+set -e
+exec > >(tee -a ${GUEST_LOG}) 2>&1
+touch /etc/cloud/cloud-init.disabled
+# Hand the network to NetworkManager (as on a normal Lubuntu install) instead
+# of the systemd-networkd config cloud-init wrote.
+rm -f /etc/netplan/50-cloud-init.yaml
+printf 'network:\n  version: 2\n  renderer: NetworkManager\n' >/etc/netplan/01-network-manager-all.yaml
+chmod 600 /etc/netplan/01-network-manager-all.yaml
+EOF
+  qm set "$VMID" --delete cicustom,ide2 >/dev/null
+  rm -f "$SNIPPET_PATH"
+  msg_ok "Removed the cloud-init drive and config snippet"
+
+  reboot_and_wait
+  if guest_run "Checking that the graphical login is running" <<'EOF'
+systemctl is-active --quiet display-manager
+EOF
+  then
+    screenshot desktop-login
+  else
+    msg_warn "The display manager is not active; check the VM console."
+  fi
+}
+
 # -----------------------------------------------------------------------------
 # 7. Shut down and snapshot
 # -----------------------------------------------------------------------------
@@ -960,11 +798,13 @@ shutdown_and_snapshot() {
 # Main
 # -----------------------------------------------------------------------------
 main() {
+  ensure_tmux
   header_info
   preflight
   start_logging
   msg_ok "Logging to ${BL}${LOG_FILE}${CL}"
-  ensure_iso
+  ensure_image
+  ensure_snippet_storage
 
   if wt --title "SETTINGS" --yesno \
 "Use default settings?
@@ -983,7 +823,7 @@ Choose No for advanced settings." 13 64; then
   header_info
   echo -e " ${BOLD}VM ${VMID}${CL}: ${HN}, ${MACHINE_TYPE}/${BIOS}, ${CORE_COUNT} cores (${CPU_TYPE}), ${RAM_SIZE} MiB RAM,"
   echo -e "        ${DISK_SIZE} GiB on ${STORAGE} (cache ${DISK_CACHE}), ${BRG} ${MAC}${VLAN}${MTU}"
-  echo -e " ISO:   ${ISO_NAME}"
+  echo -e " Image: ${CLOUD_IMAGE_NAME} + lubuntu-desktop"
   echo -e " SSH:   key $([[ -n "$SSH_PUBKEY" ]] && echo yes || echo no), PermitRootLogin ${PERMIT_ROOT}"
   echo -e " Root:  password $([[ -n "$ROOT_PW" ]] && echo set || echo "not set")"
   echo -e " xrdp:  flags '${XRDP_FLAGS:-none}'   Display: ${DISPLAY_TYPE}"
@@ -991,14 +831,14 @@ Choose No for advanced settings." 13 64; then
 
   create_vm
   if [[ "$START_VM" != "yes" ]]; then
-    msg_ok "VM created but not started (as requested). Start it and install Lubuntu manually."
+    msg_ok "VM created but not started (as requested). cloud-init runs when you start it;"
+    echo "   the desktop, nala, SSH and xrdp steps of this script are skipped."
     exit 0
   fi
 
-  manual_install_handoff
-  eject_and_reboot
-  console_bootstrap
+  first_boot
   post_install
+  finalize
   check_ssh
   shutdown_and_snapshot
 
