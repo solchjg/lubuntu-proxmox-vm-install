@@ -27,6 +27,10 @@
 #      desktop login comes up, shuts down and takes the snapshot
 #      'initial-install'.
 #
+# Rerun the script and choose "Modify an existing VM" to change RAM, cores,
+# MAC, display or disk size, rerun setup steps, or roll back / take snapshots.
+# At the end it can upload the log and screenshots to a private GitHub repo.
+#
 # Assumptions / limits:
 #   * The VM needs internet access through the chosen bridge (DHCP).
 #   * cloud-init reads its config from a "snippets" storage; if none exists
@@ -93,7 +97,10 @@ VM_PASSWORD=""
 SSH_PUBKEY=""
 PERMIT_ROOT="no"
 ROOT_PW=""                # optional root password; must differ from VM_PASSWORD
-XRDP_FLAGS="-s"           # c-nergy switches: -s sound redirection, -l custom login screen
+XRDP_FLAGS=""             # c-nergy switches: -s sound redirection, -l custom login screen
+INSTALL_BROWSERS="no"     # replace Firefox snap with Mozilla deb, remove snapd, add Brave
+SHOTS=()                  # screenshots taken in this run (for upload)
+GH_CONF_DIR="/root/.config/lubuntu-vm"    # upload settings (repo + token), root only
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -348,6 +355,56 @@ default_settings() {
   # Fall back to the storage picker if local-lvm does not exist on this host.
   pvesm status -storage "$STORAGE" >/dev/null 2>&1 || select_storage
   select_ram
+  ask_mac
+}
+
+# True if MAC $1 is used by any VM or container in the cluster other than
+# VM $2 (pass the VM being modified, or nothing for a new VM).
+mac_in_use() {
+  local mac="$1" skip="${2:-}" f
+  for f in /etc/pve/nodes/*/qemu-server/*.conf /etc/pve/nodes/*/lxc/*.conf; do
+    [[ -e "$f" ]] || continue
+    [[ -n "$skip" && "$f" == */qemu-server/"${skip}".conf ]] && continue
+    if grep -qi -- "$mac" "$f"; then
+      echo "$(basename "$f" .conf) ($(basename "$(dirname "$f")"))"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Optionally use a preset MAC address instead of the generated one.
+#   ask_mac [VMID being modified]
+# Checks the format, that it is a unicast address, that no other guest on
+# the cluster uses it, and warns if the address is already seen on the LAN.
+ask_mac() {
+  local skip="${1:-}" mac used
+  if ! ask_yn "Use a preset MAC address? (n = generated ${MAC})" n; then
+    return 0
+  fi
+  while true; do
+    ask mac "MAC address (format AA:BB:CC:DD:EE:FF)" ""
+    mac="${mac^^}"; mac="${mac//-/:}"
+    if [[ ! "$mac" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]]; then
+      echo " That is not a valid MAC address."; continue
+    fi
+    if (( 0x${mac:0:2} & 1 )); then
+      echo " That is a multicast address (first byte is odd); use a unicast address."; continue
+    fi
+    if [[ "$mac" == "00:00:00:00:00:00" ]]; then
+      echo " 00:00:00:00:00:00 is not allowed."; continue
+    fi
+    if used="$(mac_in_use "$mac" "$skip")"; then
+      echo " ${mac} is already used by guest ${used}."; continue
+    fi
+    if ip neigh show 2>/dev/null | grep -qi -- "$mac" || bridge fdb show 2>/dev/null | grep -qi -- "$mac"; then
+      msg_warn "${mac} is currently active on the network (another device may be using it)."
+      ask_yn "Use it anyway?" n || continue
+    fi
+    MAC="$mac"
+    msg_ok "Using MAC address ${MAC}"
+    return 0
+  done
 }
 
 # Ask for a positive whole number (with a minimum) until it is valid.
@@ -386,7 +443,7 @@ advanced_settings() {
   ask_number CORE_COUNT "CPU cores" "$CORE_COUNT" 1
   select_ram
   ask BRG "Bridge" "$BRG"
-  ask MAC "MAC address" "$MAC"
+  ask_mac
   ask v "VLAN tag (blank = none)" ""
   VLAN="${v:+,tag=$v}"
   ask v "Interface MTU (blank = default)" ""
@@ -424,7 +481,12 @@ post_install_settings() {
   echo " ${BOLD}Guest setup${CL}"
   ask_password "Password for user '${VM_USER}'"
   VM_PASSWORD="$PASSWORD_RESULT"
+  ask_ssh_and_root
+  ask_xrdp_and_browsers
+}
 
+# SSH key, PermitRootLogin and root password questions.
+ask_ssh_and_root() {
   # Optional public key: a file path on this host, or the key pasted in.
   local key default_key
   default_key="$(ls /root/.ssh/id_*.pub 2>/dev/null | head -n1 || true)"
@@ -455,11 +517,17 @@ post_install_settings() {
   elif [[ "$PERMIT_ROOT" == "yes" && -z "$SSH_PUBKEY" ]]; then
     msg_warn "PermitRootLogin yes without a root password or SSH key: root still cannot log in over SSH."
   fi
+}
 
+ask_xrdp_and_browsers() {
   XRDP_FLAGS=""
-  if ask_yn "xrdp: enable sound redirection (-s)?" y; then XRDP_FLAGS+="-s "; fi
+  if ask_yn "xrdp: enable sound redirection (-s)?" n; then XRDP_FLAGS+="-s "; fi
   if ask_yn "xrdp: customise the login screen (-l)?" n; then XRDP_FLAGS+="-l "; fi
   XRDP_FLAGS="${XRDP_FLAGS% }"
+
+  if ask_yn "Replace the Firefox snap with Mozilla's Firefox, remove snap, and install Brave + Brave Origin?" n; then
+    INSTALL_BROWSERS="yes"
+  fi
 }
 
 # -----------------------------------------------------------------------------
@@ -557,6 +625,7 @@ abort_install() {
   fi
   [[ -n "$SNIPPET_PATH" ]] && rm -f "$SNIPPET_PATH"
   echo "   The cached cloud image stays in ${IMAGE_CACHE_DIR}. Log: ${LOG_FILE}"
+  offer_upload
   exit 1
 }
 
@@ -573,6 +642,7 @@ screenshot() {
     --command "screendump ${file} -f png" >/dev/null 2>&1 && [[ -s "$file" ]]; then
     chmod 600 "$file"
     echo "   screenshot: ${file}"
+    SHOTS+=("$file")
   fi
   return 0
 }
@@ -692,6 +762,22 @@ guest_tail() {
 }
 
 post_install() {
+  install_desktop
+  install_nala_upgrade
+  configure_ssh
+  enable_agent
+  install_xrdp || msg_warn "xrdp install failed; see ${GUEST_LOG} in the VM. Continuing."
+  if [[ "$INSTALL_BROWSERS" == "yes" ]]; then
+    install_browsers
+  fi
+}
+
+install_browsers() {
+  replace_firefox_snap || msg_warn "Firefox/snap replacement failed; see ${GUEST_LOG} in the VM. Continuing."
+  install_brave || msg_warn "Brave install failed; see ${GUEST_LOG} in the VM. Continuing."
+}
+
+install_desktop() {
   guest_run "Installing the Lubuntu desktop (lubuntu-desktop, about 1-2 GB of downloads)" <<EOF
 set -e
 exec > >(tee -a ${GUEST_LOG}) 2>&1
@@ -703,7 +789,9 @@ for g in lpadmin sambashare dip; do
   if getent group "\$g" >/dev/null; then usermod -aG "\$g" ${VM_USER}; fi
 done
 EOF
+}
 
+install_nala_upgrade() {
   guest_run "Installing nala" <<EOF
 set -e
 exec > >(tee -a ${GUEST_LOG}) 2>&1
@@ -716,7 +804,9 @@ set -e
 exec > >(tee -a ${GUEST_LOG}) 2>&1
 nala upgrade -y
 EOF
+}
 
+configure_ssh() {
   # OpenSSH: key upload and optional PermitRootLogin. Values are passed in as
   # shell variables at the top of the script so quoting stays safe.
   guest_run "Configuring OpenSSH server" <<EOF
@@ -741,22 +831,27 @@ if [ "\$PERMIT_ROOT" = yes ]; then
   echo "PermitRootLogin yes" >/etc/ssh/sshd_config.d/10-permit-root-login.conf
 fi
 if [ -n "\$ROOT_PW" ]; then
+  # Refuse a root password equal to the user's (also catches it on reruns,
+  # where the script does not know the user's password).
+  H="\$(getent shadow "\$VM_USER" | cut -d: -f2)"
+  if [ -n "\$H" ] && [ "\$(ROOT_PW="\$ROOT_PW" perl -e 'print crypt(\$ENV{ROOT_PW}, \$ARGV[0])' "\$H")" = "\$H" ]; then
+    echo "ERROR: the root password is the same as \$VM_USER's; root password NOT changed." >&2
+    exit 3
+  fi
   echo "root:\$ROOT_PW" | chpasswd
 fi
 systemctl enable --now ssh
 systemctl restart ssh
 EOF
+}
 
+enable_agent() {
   guest_run "Enabling qemu-guest-agent" <<EOF
 set -e
 exec > >(tee -a ${GUEST_LOG}) 2>&1
 apt-get install -y qemu-guest-agent
 systemctl enable qemu-guest-agent || true   # static unit on Ubuntu; started by udev
 EOF
-
-  install_xrdp || msg_warn "xrdp install failed; see ${GUEST_LOG} in the VM. Continuing."
-  replace_firefox_snap || msg_warn "Firefox/snap replacement failed; see ${GUEST_LOG} in the VM. Continuing."
-  install_brave || msg_warn "Brave install failed; see ${GUEST_LOG} in the VM. Continuing."
 }
 
 # Find the newest xrdp-installer-X.Y.zip on c-nergy.be (fallback: 1.6).
@@ -919,19 +1014,231 @@ shutdown_and_snapshot() {
 
   msg_info "Taking snapshot '${SNAPSHOT_NAME}'"
   qm snapshot "$VMID" "$SNAPSHOT_NAME" \
-    --description "Fresh Lubuntu ${LUBUNTU_SERIES} install: nala, upgrades, OpenSSH, qemu-guest-agent, xrdp, Firefox (Mozilla deb), Brave, Brave Origin, no snap. Created $(date '+%F %T')." >/dev/null
+    --description "Fresh Lubuntu ${LUBUNTU_SERIES} install: nala, upgrades, OpenSSH, qemu-guest-agent, xrdp$([[ "$INSTALL_BROWSERS" == yes ]] && echo ", Firefox (Mozilla deb), Brave, Brave Origin, no snap"). Created $(date '+%F %T')." >/dev/null
   msg_ok "Snapshot '${SNAPSHOT_NAME}' created"
 }
 
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 8. Optional upload of the log and screenshots to a PRIVATE GitHub repo
+# -----------------------------------------------------------------------------
+# Settings live in ${GH_CONF_DIR} (mode 700): 'repo' holds owner/name and
+# 'token' a fine-grained token with Contents read/write on that repo only.
+# The token is sent from a header file, never on a command line, and the
+# repo must be private because logs contain IPs, MACs and hostnames.
+gh_api() {   # gh_api METHOD PATH [json-body-file]
+  local hdr="${TEMP_DIR}/gh-headers"
+  ( umask 077; printf 'Authorization: Bearer %s\nAccept: application/vnd.github+json\nX-GitHub-Api-Version: 2022-11-28\n' \
+      "$(cat "${GH_CONF_DIR}/token")" >"$hdr" )
+  if [[ -n "${3:-}" ]]; then
+    curl -fsS -X "$1" -H @"$hdr" --data @"$3" "https://api.github.com$2"
+  else
+    curl -fsS -X "$1" -H @"$hdr" "https://api.github.com$2"
+  fi
+}
+
+gh_setup() {
+  local repo token private
+  echo
+  echo " Uploads go to a PRIVATE repository you create on GitHub (e.g. lubuntu-vm-logs),"
+  echo " with a fine-grained token that has 'Contents: read and write' on that repo only."
+  ask repo "Repository (owner/name)" "solchjg/lubuntu-vm-logs"
+  read -r -s -p " Token (input hidden): " token; echo
+  [[ -n "$token" ]] || { echo " No token given; skipping upload."; return 1; }
+  ( umask 077; mkdir -p "$GH_CONF_DIR"; printf '%s\n' "$repo" >"${GH_CONF_DIR}/repo"; printf '%s' "$token" >"${GH_CONF_DIR}/token" )
+  private="$(gh_api GET "/repos/${repo}" 2>/dev/null | perl -MJSON -0777 -ne 'print decode_json($_)->{private} ? "yes" : "no"')" || private=""
+  if [[ "$private" != "yes" ]]; then
+    msg_error "Could not confirm that ${repo} exists and is private with this token. Nothing saved."
+    rm -f "${GH_CONF_DIR}/token" "${GH_CONF_DIR}/repo"
+    return 1
+  fi
+  msg_ok "Upload settings saved in ${GH_CONF_DIR} (root only)"
+}
+
+upload_file() {   # upload_file local-path repo-path
+  local body="${TEMP_DIR}/gh-body.json"
+  perl -MJSON -MMIME::Base64 -0777 -e '
+    open my $f, "<:raw", $ARGV[0] or die; local $/; my $d = <$f>;
+    print encode_json({ message => "Add $ARGV[1]", content => encode_base64($d, "") });' "$1" "$2" >"$body"
+  gh_api PUT "/repos/$(cat "${GH_CONF_DIR}/repo")/contents/$2" "$body" >/dev/null
+}
+
+offer_upload() {
+  local folder f ok=0 total=0
+  [[ -n "${LOG_FILE:-}" && -s "$LOG_FILE" ]] || return 0
+  echo
+  if [[ ! -s "${GH_CONF_DIR}/token" ]]; then
+    ask_yn "Upload this log and screenshots to a private GitHub repo? (sets it up now)" n || return 0
+    gh_setup || return 0
+  else
+    ask_yn "Upload this log and screenshots to $(cat "${GH_CONF_DIR}/repo")?" y || return 0
+  fi
+  folder="runs/$(basename "$LOG_FILE" .log)"
+  for f in "$LOG_FILE" "${SHOTS[@]}"; do
+    [[ -s "$f" ]] || continue
+    total=$((total + 1))
+    if upload_file "$f" "${folder}/$(basename "$f")"; then ok=$((ok + 1)); fi
+  done
+  if ((ok == total)); then
+    msg_ok "Uploaded ${ok} file(s) to $(cat "${GH_CONF_DIR}/repo")/${folder}"
+  else
+    msg_warn "Uploaded ${ok} of ${total} file(s) to $(cat "${GH_CONF_DIR}/repo")/${folder}"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# 9. Modify an existing VM (rerun the script on a VM it created)
+# -----------------------------------------------------------------------------
+# Load the settings of an existing VM into the script's variables.
+load_vm() {
+  local cfg
+  cfg="$(qm config "$VMID")"
+  HN="$(sed -n 's/^name: //p' <<<"$cfg")"
+  RAM_SIZE="$(sed -n 's/^memory: //p' <<<"$cfg")"
+  CORE_COUNT="$(sed -n 's/^cores: //p' <<<"$cfg")"
+  DISPLAY_TYPE="$(sed -n 's/^vga: \([^,]*\).*/\1/p' <<<"$cfg")"; DISPLAY_TYPE="${DISPLAY_TYPE:-std}"
+  NET0="$(sed -n 's/^net0: //p' <<<"$cfg")"
+  MAC="$(grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' <<<"$NET0" | head -n1)"
+  DISK_SIZE="$(sed -n 's/^scsi0: .*size=\([0-9]*\)G.*/\1/p' <<<"$cfg")"
+  VM_CREATED="no"   # never offer to destroy an existing VM on abort
+}
+
+# Start the VM if needed and wait for the guest agent.
+ensure_running() {
+  if [[ "$(qm status "$VMID" | awk '{print $2}')" != "running" ]]; then
+    qm start "$VMID"
+    msg_ok "Started VM ${VMID}"
+  fi
+  msg_info "Waiting for the guest agent"
+  wait_for_agent 600 || { msg_error "The guest agent did not answer."; return 1; }
+}
+
+pending_note() {
+  if [[ "$(qm status "$VMID" | awk '{print $2}')" == "running" ]]; then
+    echo "   The VM is running: this change applies after its next full stop/start."
+  fi
+}
+
+rerun_steps() {
+  local step
+  ensure_running || return 0
+  while true; do
+    echo
+    choose step "Run which setup step on VM ${VMID}?" 7 \
+      upgrade "Update packages (nala upgrade)" \
+      ssh "SSH options and root password (asks again)" \
+      password "Change ${VM_USER}'s password" \
+      xrdp "Reinstall xrdp" \
+      browsers "Firefox from Mozilla, remove snap, Brave + Brave Origin" \
+      desktop "Reinstall lubuntu-desktop" \
+      back "Back"
+    case "$step" in
+      upgrade) install_nala_upgrade || true ;;
+      ssh)
+        SSH_PUBKEY=""; PERMIT_ROOT="no"; ROOT_PW=""; VM_PASSWORD=""
+        ask_ssh_and_root
+        configure_ssh || true ;;
+      password)
+        ask_password "New password for '${VM_USER}'"
+        guest_run "Changing ${VM_USER}'s password" <<EOF || true
+set -e
+P=$(printf '%q' "$PASSWORD_RESULT")
+echo "${VM_USER}:\$P" | chpasswd
+EOF
+        ;;
+      xrdp)
+        XRDP_FLAGS=""
+        if ask_yn "xrdp: enable sound redirection (-s)?" n; then XRDP_FLAGS+="-s "; fi
+        if ask_yn "xrdp: customise the login screen (-l)?" n; then XRDP_FLAGS+="-l "; fi
+        XRDP_FLAGS="${XRDP_FLAGS% }"
+        install_xrdp || msg_warn "xrdp install failed." ;;
+      browsers) install_browsers ;;
+      desktop) install_desktop || true ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+modify_vm() {
+  local choice v snaps snap name
+  echo
+  echo " Lubuntu VMs created by this script:"
+  qm list | awk 'NR==1 || $1 ~ /^[0-9]+$/' | while read -r id rest; do
+    if [[ "$id" == VMID ]] || grep -q '^tags:.*lubuntu' "/etc/pve/qemu-server/${id}.conf" 2>/dev/null; then
+      echo "   $id $rest"
+    fi
+  done
+  while true; do
+    ask VMID "VM ID to modify" ""
+    [[ -e "/etc/pve/qemu-server/${VMID}.conf" ]] && break
+    echo " There is no VM ${VMID} on this node."
+  done
+  load_vm
+  while true; do
+    echo
+    echo " ${BOLD}VM ${VMID} (${HN})${CL}: ${CORE_COUNT} cores, ${RAM_SIZE} MiB RAM, ${DISK_SIZE:-?} GiB disk, display ${DISPLAY_TYPE}, MAC ${MAC}, $(qm status "$VMID" | awk '{print $2}')"
+    choose choice "What do you want to do?" 9 \
+      ram "Change RAM" cores "Change CPU cores" mac "Change MAC address" \
+      display "Change display" disk "Grow the disk" steps "Rerun setup steps" \
+      rollback "Roll back to a snapshot" snapshot "Take a snapshot" finish "Done"
+    case "$choice" in
+      ram) select_ram; qm set "$VMID" --memory "$RAM_SIZE" >/dev/null; msg_ok "RAM set to ${RAM_SIZE} MiB"; pending_note ;;
+      cores) ask_number CORE_COUNT "CPU cores" "$CORE_COUNT" 1; qm set "$VMID" --cores "$CORE_COUNT" >/dev/null; msg_ok "Cores set to ${CORE_COUNT}"; pending_note ;;
+      mac)
+        ask_mac "$VMID"
+        qm set "$VMID" --net0 "$(sed -E "s/([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/${MAC}/" <<<"$NET0")" >/dev/null
+        NET0="$(qm config "$VMID" | sed -n 's/^net0: //p')"
+        msg_ok "net0 is now: ${NET0}"; pending_note ;;
+      display)
+        choose DISPLAY_TYPE "Display:" 1 virtio "VirtIO-GPU" std "Standard VGA" qxl "SPICE (qxl)"
+        qm set "$VMID" --vga "$DISPLAY_TYPE" >/dev/null; msg_ok "Display set to ${DISPLAY_TYPE}"; pending_note ;;
+      disk)
+        ask_number v "New disk size in GiB (larger than ${DISK_SIZE:-current})" "$(( ${DISK_SIZE:-30} + 10 ))" $(( ${DISK_SIZE:-0} + 1 ))
+        if qm disk resize "$VMID" scsi0 "${v}G" >/dev/null; then
+          DISK_SIZE="$v"; msg_ok "Disk grown to ${v} GiB (the root partition grows on next boot)"
+        else
+          msg_error "Resize failed."
+        fi ;;
+      steps) rerun_steps ;;
+      rollback)
+        snaps="$(qm listsnapshot "$VMID" | sed -n 's/^[^A-Za-z0-9]*\([A-Za-z0-9_-]*\) .*/\1/p' | grep -v '^current$' || true)"
+        if [[ -z "$snaps" ]]; then echo " VM ${VMID} has no snapshots."; continue; fi
+        echo " Snapshots: $(echo "$snaps" | tr '\n' ' ')"
+        ask snap "Snapshot to roll back to" "$(echo "$snaps" | tail -n1)"
+        if ! grep -qx -- "$snap" <<<"$snaps"; then echo " No snapshot called ${snap}."; continue; fi
+        if ask_yn "Roll VM ${VMID} back to '${snap}'? Changes made since then are lost." n; then
+          if qm rollback "$VMID" "$snap"; then msg_ok "Rolled back to '${snap}'"; load_vm; fi
+        fi ;;
+      snapshot)
+        ask name "Snapshot name" "manual-$(date +%Y%m%d-%H%M)"
+        if qm snapshot "$VMID" "$name" --description "Taken with lubuntu-vm.sh on $(date '+%F %T')" >/dev/null; then
+          msg_ok "Snapshot '${name}' created"
+        else
+          msg_error "Snapshot failed (names may use letters, digits, - and _ only)."
+        fi ;;
+      finish) break ;;
+    esac
+  done
+  offer_upload
+  echo "   Log file: ${LOG_FILE}"
+}
+
 main() {
   ensure_tmux
   header_info
   preflight
   start_logging
   msg_ok "Logging to ${BL}${LOG_FILE}${CL}"
+
+  local mode
+  choose mode "What do you want to do?" 1 new "Create a new Lubuntu VM" modify "Modify an existing VM (rerun steps, hardware, snapshots)"
+  if [[ "$mode" == modify ]]; then
+    modify_vm
+    return 0
+  fi
+
   ensure_image
   ensure_snippet_storage
 
@@ -951,7 +1258,7 @@ main() {
   echo -e " Image: ${CLOUD_IMAGE_NAME} + lubuntu-desktop"
   echo -e " SSH:   key $([[ -n "$SSH_PUBKEY" ]] && echo yes || echo no), PermitRootLogin ${PERMIT_ROOT}"
   echo -e " Root:  password $([[ -n "$ROOT_PW" ]] && echo set || echo "not set")"
-  echo -e " xrdp:  flags '${XRDP_FLAGS:-none}'   Display: ${DISPLAY_TYPE}"
+  echo -e " xrdp:  flags '${XRDP_FLAGS:-none}'   Display: ${DISPLAY_TYPE}   Browsers/no snap: ${INSTALL_BROWSERS}"
   echo
 
   create_vm
@@ -973,6 +1280,7 @@ main() {
   if [[ "$PERMIT_ROOT" == "yes" ]]; then
     msg_warn "Reminder: PermitRootLogin yes is enabled. Keep this VM on a trusted network."
   fi
+  offer_upload
   echo "   Log file: ${LOG_FILE}"
 }
 
