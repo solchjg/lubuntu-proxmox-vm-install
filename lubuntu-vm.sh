@@ -265,6 +265,8 @@ ensure_snippet_storage() {
     fi
     content="$(pvesh get /storage/local --output-format json | perl -MJSON -0777 -ne 'print decode_json($_)->{content}')"
     pvesm set local --content "${content},snippets"
+    # Remember that we did this, so Uninstall can offer to undo it.
+    ( umask 077; mkdir -p "$GH_CONF_DIR"; touch "${GH_CONF_DIR}/snippets-enabled-on-local" )
     SNIPPET_STORAGE="local"
     msg_ok "Enabled snippets on 'local'"
   fi
@@ -1225,7 +1227,165 @@ modify_vm() {
   echo "   Log file: ${LOG_FILE}"
 }
 
+# -----------------------------------------------------------------------------
+# 10. Help and uninstall
+# -----------------------------------------------------------------------------
+show_help() {
+  cat <<EOF
+
+ lubuntu-vm.sh - build and manage Lubuntu ${LUBUNTU_SERIES} desktop VMs on Proxmox VE 9
+
+ Usage (as root on the Proxmox host):
+   bash -c "\$(curl -fsSL ${SCRIPT_URL})"
+   bash lubuntu-vm.sh [--help]
+
+ Main menu:
+   1) Create a new Lubuntu VM
+        Fully unattended: Ubuntu ${LUBUNTU_SERIES} cloud image + cloud-init, then
+        lubuntu-desktop, nala + upgrade, OpenSSH, guest agent, xrdp and
+        (optionally) Firefox from Mozilla, no snap, Brave + Brave Origin.
+        Ends with the snapshot '${SNAPSHOT_NAME}'.
+   2) Modify an existing VM
+        Change RAM, cores, MAC or display, grow the disk, rerun setup steps,
+        roll back to a snapshot or take a new one.
+   3) Uninstall
+        Remove a VM created by this script (with its disks and snapshots),
+        and/or the files this script leaves on the host.
+   4) Help        this text
+   5) Quit
+
+ Answering prompts: the default is in [brackets]; press Enter to keep it.
+ [y/N] means the default is no, [Y/n] means yes. Passwords are not shown.
+
+ While it runs:
+   * It runs inside tmux. If the shell closes: tmux attach -t ${TMUX_SESSION}
+   * Ctrl+C stops it and offers to delete a VM created in this run.
+
+ Files on the host:
+   ${LOG_DIR}/                 logs and console screenshots (root only)
+   ${IMAGE_CACHE_DIR}/${CLOUD_IMAGE_NAME}   cached cloud image
+   ${GH_CONF_DIR}/                 optional GitHub upload settings (root only)
+
+ Environment:
+   LUBUNTU_VM_NO_TMUX=1   do not start inside tmux
+
+ More: https://github.com/solchjg/lubuntu-proxmox-vm-install
+
+EOF
+}
+
+# Remove a VM created by this script, with its disks, snapshots and its
+# cloud-init snippet. Needs the VM ID typed twice.
+uninstall_vm() {
+  local id again tagged snapcount f
+  echo
+  echo " Lubuntu VMs created by this script:"
+  qm list | awk 'NR==1 || $1 ~ /^[0-9]+$/' | while read -r vid rest; do
+    if [[ "$vid" == VMID ]] || grep -q '^tags:.*lubuntu' "/etc/pve/qemu-server/${vid}.conf" 2>/dev/null; then
+      echo "   $vid $rest"
+    fi
+  done
+  ask id "VM ID to remove (blank = cancel)" ""
+  [[ -n "$id" ]] || return 0
+  if [[ ! -e "/etc/pve/qemu-server/${id}.conf" ]]; then
+    echo " There is no VM ${id} on this node."; return 0
+  fi
+  tagged=no
+  grep -q '^tags:.*lubuntu' "/etc/pve/qemu-server/${id}.conf" && tagged=yes
+  if [[ "$tagged" == no ]]; then
+    msg_warn "VM ${id} was not created by this script (no 'lubuntu' tag)."
+    ask_yn "Remove it anyway?" n || return 0
+  fi
+  snapcount="$(qm listsnapshot "$id" 2>/dev/null | grep -vc 'current' || true)"
+  echo
+  echo " ${RD}This permanently deletes VM ${id} ($(sed -n 's/^name: //p' "/etc/pve/qemu-server/${id}.conf")),${CL}"
+  echo " ${RD}all its disks and its ${snapcount} snapshot(s). It cannot be undone.${CL}"
+  ask again "Type the VM ID again to confirm (blank = cancel)" ""
+  if [[ "$again" != "$id" ]]; then
+    echo " Not confirmed; nothing removed."; return 0
+  fi
+  msg_info "Stopping VM ${id}"
+  qm stop "$id" >/dev/null 2>&1 || true
+  msg_info "Destroying VM ${id}, its disks and snapshots"
+  if qm destroy "$id" --purge 1 --destroy-unreferenced-disks 1 >/dev/null; then
+    msg_ok "VM ${id} removed"
+  else
+    msg_error "Could not destroy VM ${id}; check the web UI."
+    return 0
+  fi
+  for f in $(snippet_files "$id"); do
+    [[ -e "$f" ]] && rm -f "$f" && msg_ok "Removed leftover snippet ${f}"
+  done
+  return 0
+}
+
+# Paths of this script's cloud-init snippets on all snippet storages.
+#   snippet_files [VMID]   (blank = all)
+snippet_files() {
+  local st dir
+  for st in $(pvesm status -content snippets 2>/dev/null | awk 'NR>1 {print $1}'); do
+    dir="$(dirname "$(pvesm path "${st}:snippets/x.yaml" 2>/dev/null)")" || continue
+    # shellcheck disable=SC2086  # ${1:-*} must glob when no VMID is given
+    ls "${dir}"/lubuntu-vm-${1:-*}-user.yaml 2>/dev/null || true
+  done
+}
+
+# Remove what the script leaves on the host, asking about each item.
+uninstall_files() {
+  local img="${IMAGE_CACHE_DIR}/${CLOUD_IMAGE_NAME}" snips content del_logs=no
+  echo
+  echo " Files this script created on the host:"
+  if [[ -f "$img" ]]; then
+    ask_yn "Delete the cached cloud image (${img}, $(du -h "$img" | cut -f1))?" y && rm -f "$img" && msg_ok "Deleted ${img}"
+  fi
+  snips="$(snippet_files)"
+  if [[ -n "$snips" ]]; then
+    echo "$snips" | sed 's/^/   /'
+    ask_yn "Delete these leftover cloud-init snippets?" y && echo "$snips" | xargs rm -f && msg_ok "Deleted leftover snippets"
+  fi
+  if [[ -e "${GH_CONF_DIR}/snippets-enabled-on-local" ]]; then
+    if ask_yn "This script enabled 'snippets' on the 'local' storage. Turn that off again?" y; then
+      content="$(pvesh get /storage/local --output-format json | perl -MJSON -0777 -ne 'print join ",", grep { $_ ne "snippets" } split /,/, decode_json($_)->{content}')"
+      pvesm set local --content "$content" && rm -f "${GH_CONF_DIR}/snippets-enabled-on-local" && msg_ok "Snippets turned off on 'local'"
+    fi
+  fi
+  if [[ -s "${GH_CONF_DIR}/token" ]]; then
+    ask_yn "Delete the GitHub upload settings and token (${GH_CONF_DIR})?" y && rm -f "${GH_CONF_DIR}/token" "${GH_CONF_DIR}/repo" && msg_ok "Deleted upload settings"
+  fi
+  rmdir "$GH_CONF_DIR" 2>/dev/null || true
+  if [[ -d "$LOG_DIR" ]]; then
+    ask_yn "Delete all logs and screenshots in ${LOG_DIR} (including this run's)?" n && del_logs=yes
+  fi
+  echo "   tmux and Proxmox itself are left installed."
+  if [[ "$del_logs" == yes ]]; then
+    echo "   Deleting ${LOG_DIR} now; this run's log ends here."
+    rm -rf "$LOG_DIR"
+  fi
+  return 0
+}
+
+uninstall_menu() {
+  local what
+  echo
+  choose what "Uninstall what?" 4 \
+    vm "A VM created by this script (disks and snapshots too)" \
+    files "This script's files on the host (image cache, snippets, settings, logs)" \
+    both "Both" \
+    back "Back"
+  case "$what" in
+    vm) uninstall_vm ;;
+    files) uninstall_files ;;
+    both) uninstall_vm; uninstall_files ;;
+    *) ;;
+  esac
+}
+
 main() {
+  case "${1:-}" in
+    -h|--help) show_help; exit 0 ;;
+    "") ;;
+    *) echo " Unknown option: $1"; show_help; exit 1 ;;
+  esac
   ensure_tmux
   header_info
   preflight
@@ -1233,11 +1393,22 @@ main() {
   msg_ok "Logging to ${BL}${LOG_FILE}${CL}"
 
   local mode
-  choose mode "What do you want to do?" 1 new "Create a new Lubuntu VM" modify "Modify an existing VM (rerun steps, hardware, snapshots)"
-  if [[ "$mode" == modify ]]; then
-    modify_vm
-    return 0
-  fi
+  while true; do
+    echo
+    choose mode "What do you want to do?" 1 \
+      new "Create a new Lubuntu VM" \
+      modify "Modify an existing VM (rerun steps, hardware, snapshots)" \
+      uninstall "Uninstall (remove a VM and/or this script's files)" \
+      help "Help" \
+      quit "Quit"
+    case "$mode" in
+      new) break ;;
+      modify) modify_vm; return 0 ;;
+      uninstall) uninstall_menu ;;
+      help) show_help ;;
+      quit) echo "   Log file: ${LOG_FILE}"; return 0 ;;
+    esac
+  done
 
   ensure_image
   ensure_snippet_storage

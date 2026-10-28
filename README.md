@@ -16,6 +16,10 @@ The script restarts itself inside a `tmux` session (it offers to install tmux if
 tmux attach -t lubuntu-vm
 ```
 
+## Menu and help
+
+The script starts with a menu: **Create a new Lubuntu VM**, **Modify an existing VM**, **Uninstall**, **Help** and **Quit**. `bash lubuntu-vm.sh --help` prints the same help without starting anything.
+
 ## What happens
 
 1. **Checks.** Confirms it runs as root on Proxmox VE 9 and that the needed tools exist.
@@ -32,7 +36,7 @@ tmux attach -t lubuntu-vm
    - OpenSSH: upload the key to sadmin (and to root if root login is on), add `PermitRootLogin yes` in `/etc/ssh/sshd_config.d/10-permit-root-login.conf` if you chose it, and set the root password if you gave one
    - download the newest `xrdp-installer-X.Y.zip` from c-nergy.be (1.6 is the fallback) and run it as sadmin. sadmin gets passwordless sudo only for this step, and it is removed afterwards. If this step fails, the script warns you and carries on.
    - only if you chose it: remove the Firefox snap and snapd, and install Firefox from Mozilla's APT repository (`packages.mozilla.org`, pinned to priority 1000). APT pins block Ubuntu's snap-installing `firefox` package and snapd from coming back.
-   - install Brave (`curl -fsS https://dl.brave.com/install.sh | sh`) and Brave Origin (the same script with `FLAVOR=origin`)
+   - only if you chose it: install Brave (`curl -fsS https://dl.brave.com/install.sh | sh`) and Brave Origin (the same script with `FLAVOR=origin`)
    - if the browser or snap steps fail, the script warns you and carries on
 7. **Finalize.** Disables cloud-init, switches networking to NetworkManager (as on a normal Lubuntu install), removes the cloud-init drive and the config snippet, reboots once and checks that the graphical login (SDDM) is running and SSH answers.
 8. **Snapshot.** Shuts the VM down and takes the snapshot `initial-install`.
@@ -51,6 +55,15 @@ Run the script again and choose **Modify an existing VM**. It lists the VMs tagg
 - roll back to a snapshot (asks for confirmation) or take a new one.
 
 The modify mode never offers to delete the VM.
+
+## Uninstall
+
+Choose **Uninstall** in the menu to remove:
+
+- **a VM created by this script**, with its disks, all its snapshots and any leftover cloud-init snippet. It lists the `lubuntu`-tagged VMs, warns if you pick one without that tag, and only deletes after you type the VM ID a second time.
+- **this script's files on the host**, asking about each item: the cached cloud image, leftover snippets, the *snippets* content type on `local` (only if the script turned it on), the GitHub upload settings, and the logs and screenshots in `/var/log/lubuntu-vm/` (default no).
+
+tmux stays installed.
 
 ## Uploading logs to GitHub
 
