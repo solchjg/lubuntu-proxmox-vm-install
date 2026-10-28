@@ -15,8 +15,8 @@ bash lubuntu-vm.sh
 1. **Checks.** Confirms it runs as root on Proxmox VE 9 and that the needed tools exist.
 2. **ISO.** Looks up the newest Lubuntu 26.04.x release on cdimage.ubuntu.com. If that ISO is not already in `local` ISO storage, it downloads it and verifies the SHA256 checksum. Older `lubuntu-26.04*` ISOs are deleted unless a VM still has them attached.
 3. **Settings.** Choose *default* or *advanced*.
-   - Defaults: q35, UEFI, 30 GiB disk on `local-lvm`, cache none, 2 cores, `vmbr0`, and RAM picked from 4/8/12/16 GB or custom (8 GB preselected).
-   - Advanced: VM ID, machine type, firmware, disk size, cache, storage, hostname, CPU model, cores, RAM, bridge, MAC, VLAN, MTU, display (Standard VGA, VirtIO-GPU or SPICE), keyboard, verbose mode and start VM.
+   - Defaults: q35, UEFI, VirtIO-GPU display, 30 GiB disk on `local-lvm`, cache none, 2 cores, `vmbr0`, and RAM picked from 4/8/12/16 GB or custom (8 GB preselected).
+   - Advanced: VM ID, machine type, firmware, disk size, cache, storage, hostname, CPU model, cores, RAM, bridge, MAC, VLAN, MTU, display (VirtIO-GPU by default, Standard VGA or SPICE), keyboard, verbose mode and start VM.
    - Then: the password for `sadmin`, an optional SSH public key (a file path or the pasted key), optional `PermitRootLogin yes` (with a security warning), an optional root password (asked twice, and it must be different from sadmin's), and xrdp options (sound redirection `-s`, custom login screen `-l`).
 4. **Manual install.** The VM boots the ISO. In the Proxmox console, install Lubuntu with username **sadmin**, the same password and an English (US) keyboard. When the installer finishes, **don't click Restart**. Go back to the script and press Enter.
    - While you install, the script prints a status line every 30 seconds with the elapsed time, the VM state, how much has been written to the disk and whether it has partitions yet. Every 2 minutes it also saves a console screenshot to the log folder.
@@ -38,4 +38,5 @@ bash lubuntu-vm.sh
 - The sadmin password may only use letters, digits, spaces and US-keyboard symbols, because the script types it into the console.
 - **Logs.** Everything shown on screen is logged on the host to `/var/log/lubuntu-vm/lubuntu-vm-<date>.log`. The directory is mode 700 and the files are 600. Passwords are never printed, and menus and password boxes are drawn straight on the terminal, so no password reaches the log. Console screenshots from the auto-login step are saved next to the log so you can see where it got stuck. Commands run inside the guest are logged to `/var/log/lubuntu-vm-setup.log` in the VM.
 - The c-nergy installer officially lists standard Ubuntu 22.04 to 25.x. It may complain about Lubuntu or 26.04, which is why the xrdp step does not stop the script when it fails.
+- With the Standard VGA display, the Lubuntu 26.04 installer never appeared on screen ("Guest has not initialized the display"), which is why VirtIO-GPU is the default.
 - `PermitRootLogin yes` exposes root to brute-force attempts. Only use it on a trusted network, and prefer key login.

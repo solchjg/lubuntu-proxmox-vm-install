@@ -73,7 +73,7 @@ MAC="02:$(openssl rand -hex 5 | tr '[:lower:]' '[:upper:]' | sed 's/\(..\)/\1:/g
 VLAN=""
 MTU=""
 KEYBOARD=""
-DISPLAY_TYPE="std"        # VGA: std (Proxmox default), virtio (VirtIO-GPU), qxl (SPICE)
+DISPLAY_TYPE="virtio"     # VirtIO-GPU; std VGA left the Lubuntu 26.04 installer with no display
 VERBOSE="no"
 START_VM="yes"
 VM_CREATED="no"           # set once qm create succeeds; lets abort clean up
@@ -318,8 +318,8 @@ advanced_settings() {
   MTU="${v:+,mtu=$v}"
 
   DISPLAY_TYPE="$(wt --title "DISPLAY" --radiolist \
-    "Graphic card. Try VirtIO-GPU if the console says the display is not initialized." 12 70 3 \
-    "std" "Standard VGA (default)" ON "virtio" "VirtIO-GPU" OFF "qxl" "SPICE (qxl)" OFF)" || exit_script
+    "Graphic card. Standard VGA left the Lubuntu 26.04 installer with no display." 12 70 3 \
+    "virtio" "VirtIO-GPU (default)" ON "std" "Standard VGA" OFF "qxl" "SPICE (qxl)" OFF)" || exit_script
 
   KEYBOARD="$(wt --title "KEYBOARD" --inputbox \
     "Console keyboard layout (blank = Proxmox default).\nNote: the auto-login step types with a US layout." 10 58 "")" || exit_script
@@ -969,7 +969,7 @@ main() {
   if wt --title "SETTINGS" --yesno \
 "Use default settings?
 
-  Machine q35, UEFI, 2 CPU cores, 30 GiB disk (cache none)
+  Machine q35, UEFI, VirtIO-GPU, 2 CPU cores, 30 GiB disk (cache none)
   on ${STORAGE}, bridge ${BRG}. You pick the RAM size.
 
 Choose No for advanced settings." 13 64; then
