@@ -14,7 +14,7 @@
 #   2. Pre-flight checks (root, Proxmox VE 9, required tools).
 #   3. Downloads the official Ubuntu 26.04 server cloud image (or reuses the
 #      cached copy when its SHA256 still matches the newest release).
-#   4. Asks for VM settings with whiptail menus ("default" or "advanced",
+#   4. Asks for VM settings with plain terminal prompts ("default" or "advanced",
 #      modelled on community-scripts' ubuntu-vm.sh), the 'sadmin' password,
 #      SSH options, an optional root password and xrdp options.
 #   5. Creates the VM from the cloud image. cloud-init creates 'sadmin' and
@@ -106,9 +106,9 @@ msg_error() { echo -e " ${RD}✗ $*${CL}" >&2; }
 cleanup() { rm -rf "$TEMP_DIR"; }
 
 # Copy everything printed to stdout/stderr into LOG_FILE, with colour codes
-# stripped. The directory and file are readable by root only. whiptail draws
-# straight on /dev/tty (see wt), so menus and password boxes never reach the
-# log, and the script never echoes a password.
+# stripped. The directory and file are readable by root only. Prompts are
+# logged, but what you type is not (the terminal echoes it, not the script),
+# passwords are read with echo off, and the script never prints a password.
 start_logging() {
   umask 077
   mkdir -p "$LOG_DIR"
@@ -124,7 +124,6 @@ trap 'msg_error "Failed at line $LINENO: $BASH_COMMAND"' ERR
 trap 'trap - INT; abort_install "Interrupted (Ctrl+C)."' INT
 
 exit_script() {
-  clear
   echo -e "\n ${YW}User exited script${CL}\n"
   exit 0
 }
@@ -178,9 +177,14 @@ ensure_tmux() {
   fi
   tmux new-session -d -s "$TMUX_SESSION" \
     "${cmd}; echo; read -r -p ' Script finished. Press Enter to close this tmux session. ' _"
-  echo " Started tmux session '${TMUX_SESSION}'. If this shell closes, reattach with:"
-  echo "   tmux attach -t ${TMUX_SESSION}"
-  sleep 2
+  echo
+  echo " The script now runs inside the tmux session '${TMUX_SESSION}'."
+  echo " If this shell closes or you leave the page, it keeps running."
+  echo " To get back to it later, open a shell on this host and run:"
+  echo
+  echo "     tmux attach -t ${TMUX_SESSION}"
+  echo
+  read -r -t 30 -p " Press Enter to continue (continues by itself in 30 seconds)... " _ || true
   exec tmux attach -t "$TMUX_SESSION"
 }
 
@@ -200,11 +204,10 @@ preflight() {
   pve_major="$(pveversion | sed -n 's#^pve-manager/\([0-9]\+\).*#\1#p')"
   if [[ "$pve_major" != "9" ]]; then
     msg_warn "This script targets Proxmox VE 9 (found: $(pveversion))."
-    whiptail --backtitle "Proxmox VE Helper" --title "UNTESTED VERSION" --yesno \
-      "This script was written for Proxmox VE 9.\nContinue anyway?" 9 50 || exit_script
+    ask_yn "This script was written for Proxmox VE 9. Continue anyway?" n || exit_script
   fi
   local tool
-  for tool in curl whiptail sha256sum perl qm pvesm pvesh openssl; do
+  for tool in curl sha256sum perl qm pvesm pvesh openssl; do
     command -v "$tool" >/dev/null 2>&1 || { msg_error "Missing required tool: $tool"; exit 1; }
   done
 }
@@ -272,33 +275,72 @@ get_valid_nextid() {
   echo "$id"
 }
 
-# Wrapper so every menu has the same backtitle and exits cleanly on Cancel.
-# whiptail draws on /dev/tty (so menus stay out of the log) and returns the
-# selection on stdout.
-wt() { whiptail --backtitle "Proxmox VE Helper - Lubuntu ${LUBUNTU_SERIES} VM" "$@" 3>&1 1>/dev/tty 2>&3; }
+# Plain terminal prompts. Each shows the default in brackets; Enter keeps it.
+#   ask VAR "Question" "default"
+ask() {
+  local _answer
+  read -r -p " $2 [$3]: " _answer
+  printf -v "$1" '%s' "${_answer:-$3}"
+}
+
+#   ask_yn "Question" y|n    -> returns 0 for yes
+ask_yn() {
+  local a hint
+  [[ "$2" == y ]] && hint="Y/n" || hint="y/N"
+  while true; do
+    read -r -p " $1 [$hint]: " a
+    case "${a:-$2}" in
+      [yY]|[yY][eE][sS]) return 0 ;;
+      [nN]|[nN][oO]) return 1 ;;
+    esac
+    echo " Please answer y or n."
+  done
+}
+
+#   choose VAR "Question" default_number value1 "label1" value2 "label2" ...
+choose() {
+  local var="$1" question="$2" def="$3" n i=1 a
+  shift 3
+  local values=() labels=()
+  while (($#)); do values+=("$1"); labels+=("$2"); shift 2; done
+  n=${#values[@]}
+  echo " $question"
+  for ((i = 1; i <= n; i++)); do
+    printf '   %d) %s%s\n' "$i" "${labels[i-1]}" "$([[ $i -eq $def ]] && echo '  (default)')"
+  done
+  while true; do
+    read -r -p " Choice [${def}]: " a
+    a="${a:-$def}"
+    if [[ "$a" =~ ^[0-9]+$ ]] && ((a >= 1 && a <= n)); then
+      printf -v "$var" '%s' "${values[a-1]}"
+      return 0
+    fi
+    echo " Please enter a number from 1 to ${n}."
+  done
+}
 
 select_ram() {
   local choice
-  choice="$(wt --title "RAM" --radiolist "Allocate RAM" 14 50 5 \
-    "4096"   "4 GB"   OFF \
-    "8192"   "8 GB"   ON \
-    "12288"  "12 GB"  OFF \
-    "16384"  "16 GB"  OFF \
-    "custom" "Custom" OFF)" || exit_script
+  choose choice "Allocate RAM:" 2 4096 "4 GB" 8192 "8 GB" 12288 "12 GB" 16384 "16 GB" custom "Custom"
   if [[ "$choice" == "custom" ]]; then
-    choice="$(wt --title "RAM" --inputbox "Allocate RAM in MiB" 8 50 "$RAM_SIZE")" || exit_script
-    [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1024 ]] || { msg_error "RAM must be a number >= 1024 MiB"; exit 1; }
+    while true; do
+      ask choice "RAM in MiB" "$RAM_SIZE"
+      [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1024 ]] && break
+      echo " RAM must be a number of at least 1024 MiB."
+    done
   fi
   RAM_SIZE="$choice"
 }
 
 select_storage() {
-  local menu=() name type
-  while read -r name type _; do
-    menu+=("$name" "$type" "$([[ "$name" == "$STORAGE" ]] && echo ON || echo OFF)")
+  local args=() name type def=1 i=0
+  while read -r name type; do
+    i=$((i + 1))
+    args+=("$name" "$name ($type)")
+    [[ "$name" == "$STORAGE" ]] && def=$i
   done < <(pvesm status -content images | awk 'NR>1 {print $1, $2}')
-  [[ ${#menu[@]} -gt 0 ]] || { msg_error "No storage supports VM disk images."; exit 1; }
-  STORAGE="$(wt --title "STORAGE" --radiolist "Storage pool for the VM disk" 15 60 6 "${menu[@]}")" || exit_script
+  ((i > 0)) || { msg_error "No storage supports VM disk images."; exit 1; }
+  choose STORAGE "Storage for the VM disk:" "$def" "${args[@]}"
 }
 
 default_settings() {
@@ -308,93 +350,85 @@ default_settings() {
   select_ram
 }
 
-advanced_settings() {
-  local v
-  VMID="$(wt --title "VIRTUAL MACHINE ID" --inputbox "Set Virtual Machine ID" 8 58 "$(get_valid_nextid)")" || exit_script
-  if [[ -e "/etc/pve/qemu-server/${VMID}.conf" || -e "/etc/pve/lxc/${VMID}.conf" ]]; then
-    msg_error "ID ${VMID} is already in use."; exit 1
-  fi
-
-  MACHINE_TYPE="$(wt --title "MACHINE TYPE" --radiolist "Choose machine type" 10 58 2 \
-    "q35" "Q35 (modern, PCIe)" ON "i440fx" "i440fx (legacy)" OFF)" || exit_script
-
-  BIOS="$(wt --title "FIRMWARE" --radiolist "Choose firmware" 10 58 2 \
-    "ovmf" "UEFI (OVMF)" ON "seabios" "Legacy BIOS (SeaBIOS)" OFF)" || exit_script
-
-  DISK_SIZE="$(wt --title "DISK SIZE" --inputbox "Set Disk Size in GiB" 8 58 "$DISK_SIZE")" || exit_script
-  DISK_SIZE="${DISK_SIZE%[gG]}"
-  [[ "$DISK_SIZE" =~ ^[0-9]+$ && "$DISK_SIZE" -ge 15 ]] || { msg_error "Disk size must be a number >= 15"; exit 1; }
-
-  DISK_CACHE="$(wt --title "DISK CACHE" --radiolist "Choose disk cache mode" 12 58 4 \
-    "none" "None (default)" ON "writethrough" "Write through" OFF \
-    "writeback" "Write back" OFF "directsync" "Direct sync" OFF)" || exit_script
-
-  select_storage
-
-  HN="$(wt --title "HOSTNAME" --inputbox "Set Hostname" 8 58 "$HN")" || exit_script
-  HN="$(echo "${HN,,}" | tr -d ' ')"
-
-  CPU_TYPE="$(wt --title "CPU MODEL" --radiolist "Choose CPU model" 11 58 3 \
-    "x86-64-v2-AES" "Proxmox default" ON "host" "Host (best performance)" OFF \
-    "kvm64" "KVM64 (most compatible)" OFF)" || exit_script
-
-  CORE_COUNT="$(wt --title "CORE COUNT" --inputbox "Allocate CPU Cores" 8 58 "$CORE_COUNT")" || exit_script
-  [[ "$CORE_COUNT" =~ ^[0-9]+$ && "$CORE_COUNT" -ge 1 ]] || { msg_error "Core count must be a positive number"; exit 1; }
-
-  select_ram
-
-  BRG="$(wt --title "BRIDGE" --inputbox "Set a Bridge" 8 58 "$BRG")" || exit_script
-  MAC="$(wt --title "MAC ADDRESS" --inputbox "Set a MAC Address" 8 58 "$MAC")" || exit_script
-
-  v="$(wt --title "VLAN" --inputbox "Set a VLAN tag (leave blank for default)" 8 58 "")" || exit_script
-  VLAN="${v:+,tag=$v}"
-  v="$(wt --title "MTU SIZE" --inputbox "Set interface MTU (leave blank for default)" 8 58 "")" || exit_script
-  MTU="${v:+,mtu=$v}"
-
-  DISPLAY_TYPE="$(wt --title "DISPLAY" --radiolist \
-    "Graphic card for the VM console." 12 70 3 \
-    "virtio" "VirtIO-GPU (default)" ON "std" "Standard VGA" OFF "qxl" "SPICE (qxl)" OFF)" || exit_script
-
-  KEYBOARD="$(wt --title "KEYBOARD" --inputbox \
-    "Console keyboard layout (blank = Proxmox default)." 9 58 "")" || exit_script
-
-  if wt --title "VERBOSE MODE" --defaultno --yesno "Show command output (verbose mode)?" 8 58; then VERBOSE="yes"; fi
-  if ! wt --title "START VIRTUAL MACHINE" --yesno "Start VM and continue with the install when done?" 8 58; then START_VM="no"; fi
-
-  wt --title "ADVANCED SETTINGS COMPLETE" --yesno "Ready to create a Lubuntu ${LUBUNTU_SERIES} VM?" 8 58 \
-    || { header_info; advanced_settings; }
+# Ask for a positive whole number (with a minimum) until it is valid.
+ask_number() {
+  local var="$1" question="$2" def="$3" min="$4" v
+  while true; do
+    ask v "$question" "$def"
+    v="${v%[gG]}"
+    if [[ "$v" =~ ^[0-9]+$ ]] && ((v >= min)); then printf -v "$var" '%s' "$v"; return 0; fi
+    echo " Please enter a whole number of at least ${min}."
+  done
 }
 
-# Questions about the guest setup (password, SSH, xrdp).
-# Ask for a password twice until both entries match and pass the checks.
-#   ask_password <title> <prompt> [password it must differ from]
+advanced_settings() {
+  local v
+  echo
+  echo " ${BOLD}Advanced settings${CL} (press Enter to keep the value in brackets)"
+  while true; do
+    ask VMID "Virtual Machine ID" "$(get_valid_nextid)"
+    if [[ ! "$VMID" =~ ^[0-9]+$ ]]; then
+      echo " The ID must be a number."
+    elif [[ -e "/etc/pve/qemu-server/${VMID}.conf" || -e "/etc/pve/lxc/${VMID}.conf" ]]; then
+      echo " ID ${VMID} is already in use."
+    else
+      break
+    fi
+  done
+  choose MACHINE_TYPE "Machine type:" 1 q35 "Q35 (modern, PCIe)" i440fx "i440fx (legacy)"
+  choose BIOS "Firmware:" 1 ovmf "UEFI (OVMF)" seabios "Legacy BIOS (SeaBIOS)"
+  ask_number DISK_SIZE "Disk size in GiB" "$DISK_SIZE" 15
+  choose DISK_CACHE "Disk cache:" 1 none "None" writethrough "Write through" writeback "Write back" directsync "Direct sync"
+  select_storage
+  ask HN "Hostname" "$HN"
+  HN="$(echo "${HN,,}" | tr -d ' ')"
+  choose CPU_TYPE "CPU model:" 1 x86-64-v2-AES "x86-64-v2-AES (Proxmox default)" host "host (best performance)" kvm64 "kvm64 (most compatible)"
+  ask_number CORE_COUNT "CPU cores" "$CORE_COUNT" 1
+  select_ram
+  ask BRG "Bridge" "$BRG"
+  ask MAC "MAC address" "$MAC"
+  ask v "VLAN tag (blank = none)" ""
+  VLAN="${v:+,tag=$v}"
+  ask v "Interface MTU (blank = default)" ""
+  MTU="${v:+,mtu=$v}"
+  choose DISPLAY_TYPE "Display:" 1 virtio "VirtIO-GPU" std "Standard VGA" qxl "SPICE (qxl)"
+  ask KEYBOARD "Console keyboard layout (blank = Proxmox default)" ""
+  if ask_yn "Verbose mode (show command output)?" n; then VERBOSE="yes"; fi
+  if ! ask_yn "Start the VM and run the full setup when it is created?" y; then START_VM="no"; fi
+  ask_yn "Ready to create the VM with these settings?" y || advanced_settings
+}
+
+# Ask for a password twice (typing is hidden) until both entries match.
+#   ask_password "Prompt" [password it must differ from]
 # The result is left in PASSWORD_RESULT.
 ask_password() {
-  local title="$1" prompt="$2" forbidden="${3:-}" p1 p2
+  local prompt="$1" forbidden="${2:-}" p1 p2
   while true; do
-    p1="$(wt --title "$title" --passwordbox "$prompt" 10 64)" || exit_script
-    p2="$(wt --title "$title" --passwordbox "Confirm password" 8 64)" || exit_script
+    read -r -s -p " ${prompt}: " p1; echo
+    read -r -s -p " Confirm password: " p2; echo
     if [[ -z "$p1" ]]; then
-      wt --title "ERROR" --msgbox "Password cannot be empty." 8 40
+      echo " Password cannot be empty."
     elif [[ "$p1" != "$p2" ]]; then
-      wt --title "ERROR" --msgbox "Passwords do not match." 8 40
+      echo " Passwords do not match; try again."
     elif [[ -n "$forbidden" && "$p1" == "$forbidden" ]]; then
-      wt --title "ERROR" --msgbox "The root password must be different from ${VM_USER}'s password." 8 64
+      echo " The root password must be different from ${VM_USER}'s password."
     else
       PASSWORD_RESULT="$p1"; return 0
     fi
   done
 }
 
+# Questions about the guest setup (password, SSH, xrdp).
 post_install_settings() {
-  ask_password "PASSWORD FOR ${VM_USER}" "Password for user '${VM_USER}'."
+  echo
+  echo " ${BOLD}Guest setup${CL}"
+  ask_password "Password for user '${VM_USER}'"
   VM_PASSWORD="$PASSWORD_RESULT"
 
   # Optional public key: a file path on this host, or the key pasted in.
-  local key
-  key="$(wt --title "SSH PUBLIC KEY" --inputbox \
-    "Optional: path to a public key file on this host, or paste the key.\nLeave blank to skip." 10 70 \
-    "$(ls /root/.ssh/id_*.pub 2>/dev/null | head -n1)")" || exit_script
+  local key default_key
+  default_key="$(ls /root/.ssh/id_*.pub 2>/dev/null | head -n1 || true)"
+  ask key "SSH public key file or pasted key (blank = skip)" "$default_key"
   if [[ -n "$key" && -f "$key" ]]; then
     SSH_PUBKEY="$(cat "$key")"
   elif [[ "$key" =~ ^(ssh-|ecdsa-|sk-) ]]; then
@@ -403,38 +437,28 @@ post_install_settings() {
     msg_warn "That input is neither a file nor a public key; skipping key upload."
   fi
 
-  if wt --title "PERMIT ROOT LOGIN" --defaultno --yesno \
-    "Set 'PermitRootLogin yes' in the SSH server config?" 8 60; then
-    wt --title "SECURITY WARNING" --defaultno --yesno \
-"WARNING: PermitRootLogin yes lets anyone who can reach port 22 try to log
-in as root. Combined with a password this is a common target for
-brute-force attacks. Only use it on a trusted, isolated network, and
-prefer key-based login.
-
-Enable PermitRootLogin yes anyway?" 14 76 && PERMIT_ROOT="yes"
+  if ask_yn "Set 'PermitRootLogin yes' in the SSH server config?" n; then
+    echo
+    echo " ${YW}WARNING:${CL} PermitRootLogin yes lets anyone who can reach port 22 try to log in"
+    echo " as root. With a password this is a common target for brute-force attacks."
+    echo " Only use it on a trusted, isolated network, and prefer key-based login."
+    if ask_yn "Enable PermitRootLogin yes anyway?" n; then PERMIT_ROOT="yes"; fi
   fi
   if [[ "$PERMIT_ROOT" == "yes" ]]; then
     msg_warn "PermitRootLogin yes will be enabled. Use only on a trusted network."
   fi
 
   # Optional root password. Ubuntu leaves root without one (locked).
-  if wt --title "ROOT PASSWORD" --defaultno --yesno \
-    "Ubuntu's root account has no password by default.\n\nSet a root password? It must be different from ${VM_USER}'s." 11 70; then
-    ask_password "ROOT PASSWORD" "Password for root (must differ from ${VM_USER}'s)." "$VM_PASSWORD"
+  if ask_yn "Set a root password? (must be different from ${VM_USER}'s)" n; then
+    ask_password "Password for root" "$VM_PASSWORD"
     ROOT_PW="$PASSWORD_RESULT"
   elif [[ "$PERMIT_ROOT" == "yes" && -z "$SSH_PUBKEY" ]]; then
     msg_warn "PermitRootLogin yes without a root password or SSH key: root still cannot log in over SSH."
   fi
 
-  # whiptail treats tags starting with '-' as its own options and exits, so
-  # the menu uses plain words and they are mapped to installer switches.
-  local flags
-  flags="$(wt --title "XRDP OPTIONS" --checklist "c-nergy xrdp installer options" 11 64 2 \
-    "sound" "Enable sound redirection (-s)" ON \
-    "login" "Customise the xrdp login screen (-l)" OFF)" || exit_script
   XRDP_FLAGS=""
-  [[ "$flags" == *sound* ]] && XRDP_FLAGS+="-s "
-  [[ "$flags" == *login* ]] && XRDP_FLAGS+="-l "
+  if ask_yn "xrdp: enable sound redirection (-s)?" y; then XRDP_FLAGS+="-s "; fi
+  if ask_yn "xrdp: customise the login screen (-l)?" n; then XRDP_FLAGS+="-l "; fi
   XRDP_FLAGS="${XRDP_FLAGS% }"
 }
 
@@ -588,7 +612,7 @@ first_boot() {
     [[ "${ans,,}" == n* ]] && abort_install "Stopped waiting for the guest agent."
   done
   # cloud-init may still be finishing package installs; let it complete.
-  guest_run "Waiting for cloud-init to finish" <<'EOF'
+  GUEST_PROGRESS_FILE=/var/log/cloud-init-output.log guest_run "Waiting for cloud-init to finish" <<'EOF'
 cloud-init status --wait >/dev/null || true
 EOF
 }
@@ -604,24 +628,67 @@ reboot_and_wait() {
 # 6. Post-install through the guest agent
 # -----------------------------------------------------------------------------
 # Run a bash script inside the guest as root. The script text is sent on
-# stdin so passwords never appear on a command line.
+# stdin so passwords never appear on a command line. While it runs, a live
+# line shows the elapsed time and the latest line of the guest log, so it is
+# clear the script has not hung.
 #   guest_run "Description" <<'EOF' ... EOF
+#   GUEST_PROGRESS_FILE=/path guest_run ...   (log file to show; default GUEST_LOG)
 guest_run() {
-  local desc="$1" json code out
+  local desc="$1" json pid status code out start now elapsed last_peek=-10 latest="" cols
+  local progress_file="${GUEST_PROGRESS_FILE:-$GUEST_LOG}"
   msg_info "$desc"
-  json="$(qm guest exec "$VMID" --timeout 7200 --pass-stdin 1 -- \
+  json="$(qm guest exec "$VMID" --synchronous 0 --pass-stdin 1 -- \
     /usr/bin/env DEBIAN_FRONTEND=noninteractive TERM=dumb \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     bash -s)" || true
-  code="$(perl -MJSON -0777 -ne 'my $j = decode_json($_); print exists $j->{exitcode} ? $j->{exitcode} : "timeout"' <<<"$json")"
-  out="$(perl -MJSON -0777 -ne 'my $j = decode_json($_); print $j->{"out-data"} // ""; print $j->{"err-data"} // ""' <<<"$json")"
+  pid="$(perl -MJSON -0777 -ne 'my $j = eval { decode_json($_) } || {}; print $j->{pid} // ""' <<<"$json")"
+  if [[ -z "$pid" ]]; then
+    msg_error "${desc}: could not start the command in the guest."
+    return 1
+  fi
+
+  start=$(date +%s)
+  cols=$(tput cols 2>/dev/null || echo 80)
+  while true; do
+    status="$(qm guest exec-status "$VMID" "$pid" 2>/dev/null || echo '{}')"
+    if [[ "$(perl -MJSON -0777 -ne 'my $j = eval { decode_json($_) } || {}; print $j->{exited} ? 1 : 0' <<<"$status")" == 1 ]]; then
+      break
+    fi
+    now=$(date +%s); elapsed=$((now - start))
+    if ((elapsed > 7200)); then
+      printf '\r\033[K' >/dev/tty
+      msg_error "${desc}: still running after 2 hours; giving up."
+      return 1
+    fi
+    if ((elapsed - last_peek >= 10)); then
+      last_peek=$elapsed
+      latest="$(guest_tail "$progress_file")"
+    fi
+    printf '\r\033[K   [%02d:%02d] %s' $((elapsed / 60)) $((elapsed % 60)) \
+      "${latest:0:$((cols - 14))}" >/dev/tty
+    sleep 2
+  done
+  printf '\r\033[K' >/dev/tty
+  elapsed=$(( $(date +%s) - start ))
+
+  code="$(perl -MJSON -0777 -ne 'my $j = decode_json($_); print exists $j->{exitcode} ? $j->{exitcode} : "unknown"' <<<"$status")"
+  out="$(perl -MJSON -0777 -ne 'my $j = decode_json($_); print $j->{"out-data"} // ""; print $j->{"err-data"} // ""' <<<"$status")"
   if [[ "$VERBOSE" == "yes" && -n "$out" ]]; then echo "$out"; fi
   if [[ "$code" != "0" ]]; then
     msg_error "${desc} failed (exit ${code}). Last output:"
     echo "$out" | tail -n 20 >&2
     return 1
   fi
-  msg_ok "$desc"
+  msg_ok "${desc} ($((elapsed / 60))m $((elapsed % 60))s)"
+}
+
+# Latest non-empty line of a log file inside the guest (apt progress uses
+# carriage returns, so those count as line breaks). Empty if unavailable.
+guest_tail() {
+  qm guest exec "$VMID" --timeout 10 -- sh -c \
+    "tail -c 600 '$1' 2>/dev/null | tr '\r' '\n' | grep -v '^[[:space:]]*\$' | tail -n 1" 2>/dev/null \
+    | perl -MJSON -0777 -ne 'my $j = eval { decode_json($_) } || {}; my $o = $j->{"out-data"} // ""; $o =~ s/[^[:print:]]//g; print $o' \
+    || true
 }
 
 post_install() {
@@ -806,16 +873,12 @@ main() {
   ensure_image
   ensure_snippet_storage
 
-  if wt --title "SETTINGS" --yesno \
-"Use default settings?
-
-  Machine q35, UEFI, VirtIO-GPU, 2 CPU cores, 30 GiB disk (cache none)
-  on ${STORAGE}, bridge ${BRG}. You pick the RAM size.
-
-Choose No for advanced settings." 13 64; then
+  echo
+  echo " Default settings: q35, UEFI, VirtIO-GPU, 2 CPU cores, 30 GiB disk (cache none)"
+  echo " on ${STORAGE}, bridge ${BRG}. You pick the RAM size."
+  if ask_yn "Use the default settings? (n = advanced settings)" y; then
     default_settings
   else
-    header_info
     advanced_settings
   fi
   post_install_settings

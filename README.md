@@ -10,7 +10,7 @@ Run as root on the Proxmox host:
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/solchjg/lubuntu-proxmox-vm-install/main/lubuntu-vm.sh)"
 ```
 
-The script restarts itself inside a `tmux` session (it offers to install tmux if it's missing). If you close the Proxmox shell, the script keeps running, and you can reattach with:
+The script restarts itself inside a `tmux` session (it offers to install tmux if it's missing). It shows how to reattach and waits 30 seconds, or until you press Enter, so you can read it. If you close the Proxmox shell, the script keeps running, and you can reattach with:
 
 ```bash
 tmux attach -t lubuntu-vm
@@ -21,12 +21,12 @@ tmux attach -t lubuntu-vm
 1. **Checks.** Confirms it runs as root on Proxmox VE 9 and that the needed tools exist.
 2. **Cloud image.** Downloads `ubuntu-26.04-server-cloudimg-amd64.img` into `/var/lib/vz/template/cache/` and verifies its SHA256. A cached copy is reused if it still matches the newest release; otherwise it is replaced.
 3. **Snippets storage.** cloud-init reads its config from a storage with the *snippets* content type. If no storage has it, the script offers to enable snippets on `local`.
-4. **Settings.** Choose *default* or *advanced*.
+4. **Settings.** Plain terminal prompts: the default is shown in brackets and Enter keeps it. Choose *default* or *advanced*.
    - Defaults: q35, UEFI, VirtIO-GPU display, 30 GiB disk on `local-lvm`, cache none, 2 cores, `vmbr0`, and RAM picked from 4/8/12/16 GB or custom (8 GB preselected).
    - Advanced: VM ID, machine type, firmware, disk size, cache, storage, hostname, CPU model, cores, RAM, bridge, MAC, VLAN, MTU, display (VirtIO-GPU, Standard VGA or SPICE), keyboard, verbose mode and start VM.
    - Then: the password for `sadmin`, an optional SSH public key (a file path or the pasted key), optional `PermitRootLogin yes` (with a security warning), an optional root password (asked twice, and it must be different from sadmin's), and xrdp options (sound redirection `-s`, custom login screen `-l`).
 5. **Create and first boot.** Imports the cloud image as the VM disk, grows it to the chosen size and attaches a cloud-init drive. On first boot, cloud-init creates `sadmin` and installs `qemu-guest-agent` and `openssh-server`. The script prints a status line every 30 seconds until the guest agent answers, usually within 2 to 5 minutes. If nothing has happened after 15 minutes, it saves a screenshot and asks whether to keep waiting.
-6. **Post-install** (through `qm guest exec`, as root in the guest):
+6. **Post-install** (through `qm guest exec`, as root in the guest). Each step shows a live line with the elapsed time and the latest line of the guest's log, so you can see it's still working, plus its total time when it finishes:
    - install `lubuntu-desktop` (the same package set the Lubuntu ISO installs, about 1 to 2 GB of downloads) and make the graphical login the default
    - install nala, then `nala upgrade -y`
    - OpenSSH: upload the key to sadmin (and to root if root login is on), add `PermitRootLogin yes` in `/etc/ssh/sshd_config.d/10-permit-root-login.conf` if you chose it, and set the root password if you gave one
@@ -42,7 +42,7 @@ Ctrl+C, or answering *n* when asked to keep waiting, asks `Delete VM <id> and al
 
 - The cloud-init snippet contains only a SHA-512 hash of the sadmin password. It's mode 600 and is deleted once the VM is set up.
 - The root password is set inside the guest through the guest agent's stdin, so it never appears on a command line or in a file on the host.
-- **Logs.** Everything shown on screen is logged on the host to `/var/log/lubuntu-vm/lubuntu-vm-<date>.log`. The directory is mode 700 and the files are 600. Passwords are never printed, and menus and password boxes are drawn straight on the terminal, so no password reaches the log. Commands run inside the guest are logged to `/var/log/lubuntu-vm-setup.log` in the VM.
+- **Logs.** Everything shown on screen is logged on the host to `/var/log/lubuntu-vm/lubuntu-vm-<date>.log`. The directory is mode 700 and the files are 600. Prompts are logged but your answers aren't, passwords are typed with echo off, and the script never prints a password, so no password reaches the log. Commands run inside the guest are logged to `/var/log/lubuntu-vm-setup.log` in the VM.
 - `PermitRootLogin yes` exposes root to brute-force attempts. Only use it on a trusted network, and prefer key login.
 
 ## Notes
